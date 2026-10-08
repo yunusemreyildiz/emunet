@@ -1,0 +1,45 @@
+class Emunet < Formula
+  desc "Keep Android emulator and macOS internet working across VPN and proxy changes"
+  homepage "@HOMEPAGE@"
+  url "@URL@"
+  version "@VERSION@"
+  sha256 "@SHA@"
+  license "MIT"
+
+  depends_on :macos
+  depends_on "node"
+
+  def install
+    libexec.install "emunet.mjs"
+    (bin/"emunet").write <<~EOS
+      #!/bin/bash
+      export UV_THREADPOOL_SIZE=16
+      exec "#{Formula["node"].opt_bin}/node" "#{libexec}/emunet.mjs" "$@"
+    EOS
+  end
+
+  service do
+    run [opt_bin/"emunet", "daemon"]
+    keep_alive true
+    log_path var/"log/emunet.log"
+    error_log_path var/"log/emunet.log"
+  end
+
+  def caveats
+    <<~EOS
+      Start the background service (needed for everything else):
+        brew services start emunet
+
+      When the internet breaks (VPN on/off, proxy tool crashed, emulator offline):
+        emunet fix
+
+      Optional, recommended with VPN clients that break macOS DNS (e.g. OpenVPN Connect):
+        emunet mac-dns on      # undo with: emunet mac-dns off
+      Run `emunet mac-dns off` before uninstalling, or the Mac is left without DNS.
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/emunet version")
+  end
+end
