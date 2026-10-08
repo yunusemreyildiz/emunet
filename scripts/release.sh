@@ -20,5 +20,5 @@ OUT="${TAP_DIR:+$TAP_DIR/Formula/emunet.rb}"
 OUT="${OUT:-$ROOT/dist/emunet.rb}"
 mkdir -p "$(dirname "$OUT")"
 sed -e "s|@URL@|$URL|" -e "s|@SHA@|$SHA|" -e "s|@VERSION@|$VERSION|" \
-  -e "s|@HOMEPAGE@|https://github.com/$OWNER/emunet|" "$ROOT/Formula/emunet.rb.in" > "$OUT"
+  -e "s|@HOMEPAGE@|https://github.com/$OWNER/emunet|" -e "/^  version \"/d" "$ROOT/Formula/emunet.rb.in" > "$OUT"
 echo "Wrote $OUT (v$VERSION, sha256 $SHA)"
