@@ -22,7 +22,14 @@ import { execFile, spawn, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
+
+// getaddrinfo runs on libuv's thread pool; a hung VPN resolver must not starve the proxy.
+process.env.UV_THREADPOOL_SIZE ||= '16';
+
+const SERVICE_LABEL = 'local.emunet';
+const SERVICE_PLIST = path.join(os.homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);
+const SERVICE_LOG = path.join(os.homedir(), 'Library', 'Logs', 'emunet.log');
 
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'emunet');
 const STATE_FILE = path.join(CONFIG_DIR, 'state.json');
@@ -815,19 +822,138 @@ async function setSystemProxyOff() {
 }
 
 async function startDaemon() {
-  const uid = process.getuid();
-  const plist = path.join(os.homedir(), 'Library', 'LaunchAgents', 'local.emunet.plist');
-  if (fs.existsSync(plist)) {
-    await execFileAsync('/bin/launchctl', ['bootstrap', `gui/${uid}`, plist]).catch(() => {});
-    await execFileAsync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/local.emunet`]).catch(() => {});
-  } else {
+  if (isBrewInstall()) {
     await execFileAsync('brew', ['services', 'restart', 'emunet']).catch(() => {});
+  } else if (fs.existsSync(SERVICE_PLIST)) {
+    const uid = process.getuid();
+    await execFileAsync('/bin/launchctl', ['bootstrap', `gui/${uid}`, SERVICE_PLIST]).catch(() => {});
+    await execFileAsync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/${SERVICE_LABEL}`]).catch(() => {});
+  } else {
+    await installService({ quiet: true });
   }
+  return waitForDaemon();
+}
+
+async function waitForDaemon() {
   for (let i = 0; i < 20; i += 1) {
     if (await probeTcp('127.0.0.1', state.proxyPort, 500)) return true;
     await sleep(500);
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Background service (LaunchAgent), shared by the curl and npm installs.
+// Homebrew installs are handed to `brew services`.
+// ---------------------------------------------------------------------------
+
+function scriptPath() {
+  return fs.realpathSync(process.argv[1]);
+}
+
+function isBrewInstall() {
+  return /\/(Cellar|opt)\/emunet\//.test(scriptPath());
+}
+
+// Prefer a stable `node` on PATH (e.g. /opt/homebrew/bin/node) over the versioned Cellar path,
+// so Node upgrades do not break the service.
+function stableNode() {
+  const dirs = [...(process.env.PATH || '').split(':'), '/opt/homebrew/bin', '/usr/local/bin'];
+  return dirs.map((dir) => path.join(dir, 'node')).find((candidate) => isExecutable(candidate)) || process.execPath;
+}
+
+function isExecutable(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function plistXml(node, script) {
+  const esc = (value) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${SERVICE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>${esc(node)}</string><string>${esc(script)}</string><string>daemon</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>UV_THREADPOOL_SIZE</key><string>16</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${esc(SERVICE_LOG)}</string>
+  <key>StandardErrorPath</key><string>${esc(SERVICE_LOG)}</string>
+</dict>
+</plist>
+`;
+}
+
+async function launchAgentLoaded() {
+  return execFileAsync('/bin/launchctl', ['print', `gui/${process.getuid()}/${SERVICE_LABEL}`]).then(() => true, () => false);
+}
+
+async function bootoutAgent() {
+  await execFileAsync('/bin/launchctl', ['bootout', `gui/${process.getuid()}/${SERVICE_LABEL}`]).catch(() => {});
+  // bootout returns before the job is gone; bootstrapping too early fails with error 5.
+  for (let i = 0; i < 50 && (await launchAgentLoaded()); i += 1) await sleep(200);
+}
+
+async function installService({ quiet = false } = {}) {
+  if (isBrewInstall()) {
+    const ok = spawnSync('brew', ['services', 'restart', 'emunet'], { stdio: quiet ? 'ignore' : 'inherit' }).status === 0;
+    if (!quiet) console.log(ok ? 'Started with brew services.' : 'brew services failed.');
+    return ok;
+  }
+  fs.mkdirSync(path.dirname(SERVICE_PLIST), { recursive: true });
+  fs.mkdirSync(path.dirname(SERVICE_LOG), { recursive: true });
+  fs.writeFileSync(SERVICE_PLIST, plistXml(stableNode(), scriptPath()));
+  await bootoutAgent();
+  let loaded = false;
+  for (let i = 0; i < 4 && !loaded; i += 1) {
+    loaded = await execFileAsync('/bin/launchctl', ['bootstrap', `gui/${process.getuid()}`, SERVICE_PLIST]).then(() => true, () => false);
+    if (!loaded) await sleep(1000);
+  }
+  const up = loaded && (await waitForDaemon());
+  if (!quiet) {
+    console.log(up ? `emunet service running (LaunchAgent ${SERVICE_PLIST}, log ${SERVICE_LOG}).` : 'The service did not start; see the log: ' + SERVICE_LOG);
+  }
+  return up;
+}
+
+async function uninstallService() {
+  const service = await primaryService();
+  if (service?.dnsServers.includes('127.0.0.1')) {
+    console.log('The Mac\'s DNS points at emunet; switching it back to automatic first.');
+    await setMacDns(false);
+  }
+  if (isBrewInstall()) {
+    spawnSync('brew', ['services', 'stop', 'emunet'], { stdio: 'inherit' });
+  }
+  await bootoutAgent();
+  fs.rmSync(SERVICE_PLIST, { force: true });
+  console.log('emunet service removed.');
+}
+
+async function cmdService(action) {
+  if (action === 'install' || action === 'start') {
+    if (!(await installService())) process.exitCode = 1;
+  } else if (action === 'uninstall' || action === 'stop') {
+    await uninstallService();
+  } else if (action === 'status' || !action) {
+    const up = await probeTcp('127.0.0.1', state.proxyPort, 800);
+    const how = isBrewInstall() ? 'brew services' : (await launchAgentLoaded()) ? `LaunchAgent ${SERVICE_PLIST}` : 'not installed';
+    console.log(`emunet service: ${up ? 'running' : 'not running'} (${how})`);
+    if (!up) process.exitCode = 1;
+  } else {
+    console.error('Usage: emunet service install|uninstall|status');
+    process.exitCode = 1;
+  }
 }
 
 function ask(question) {
@@ -1054,7 +1180,7 @@ async function cmdStatus() {
   try {
     status = await fetchStatus();
   } catch {
-    console.log(`emunet is not running (127.0.0.1:${state.proxyPort}). Start it: brew services start emunet  (or: emunet fix)`);
+    console.log(`emunet is not running (127.0.0.1:${state.proxyPort}). Start it: emunet service install`);
     process.exitCode = 1;
     return;
   }
@@ -1150,6 +1276,7 @@ const HELP = `emunet ${VERSION} — keep Android emulator and macOS internet wor
   emunet fix [--yes]                 detect and repair internet problems (Mac + emulators)
   emunet doctor                      diagnose only; changes nothing
   emunet status                      show what emunet is doing
+  emunet service install|uninstall   run emunet in the background at login / remove it
   emunet mac-dns on|off              point the Mac's DNS at emunet (survives broken VPN DNS) / undo
   emunet upstream [auto|none|h:p]    debugging proxy to chain through (auto-detects Proxyman,
                                      Charles, mitmproxy, Burp, Fiddler, HTTP Toolkit, Requestly, Whistle)
@@ -1176,6 +1303,9 @@ switch (command) {
     break;
   case 'upstream':
     await cmdUpstream(rest[0]);
+    break;
+  case 'service':
+    await cmdService(rest[0]);
     break;
   case 'on':
     saveState({ manageEmulators: true });

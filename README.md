@@ -25,13 +25,34 @@ Fixed 2 of 2 problem(s).
 
 ## Install
 
+Pick one. All three end with the same `emunet` command and a background service that starts at login.
+
+**Homebrew**
+
 ```bash
 brew install yunusemreyildiz/tap/emunet
 brew services start emunet
 ```
 
-Requirements: macOS, Node.js (installed by Homebrew), Android SDK platform-tools (`adb`) for the
-emulator features.
+**One-line installer** (no Homebrew; needs Node.js 18+)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yunusemreyildiz/emunet/main/install.sh | bash
+```
+
+It downloads `emunet.mjs` from the latest GitHub release into `~/Library/Application Support/emunet`,
+links the `emunet` command and starts the service as a LaunchAgent in your account. No sudo.
+Prefer to read it first? `curl -fsSLO https://raw.githubusercontent.com/yunusemreyildiz/emunet/main/install.sh`,
+then `bash install.sh`.
+
+**npm** (needs Node.js 18+)
+
+```bash
+npm install -g emunet
+emunet service install
+```
+
+Android SDK platform-tools (`adb`) are needed for the emulator features.
 
 ## Usage
 
@@ -40,6 +61,7 @@ emulator features.
 | `emunet fix [--yes]` | Diagnose and repair (asks before disruptive steps such as restarting an emulator; `--yes` skips the questions) |
 | `emunet doctor` | Diagnose only, changes nothing |
 | `emunet status` | What emunet is doing right now |
+| `emunet service install\|uninstall\|status` | Run emunet in the background at login (LaunchAgent, or `brew services` for Homebrew installs) |
 | `emunet mac-dns on\|off` | Point the Mac's own DNS at emunet so broken VPN DNS can't take the whole Mac down (see below) |
 | `emunet upstream [auto\|none\|host:port]` | Which debugging proxy to chain emulator traffic through |
 | `emunet emulator <avd> [--restart]` | (Re)start an emulator with emunet DNS |
@@ -103,7 +125,7 @@ Your own scripts can do the same with `emulator -avd <name> -no-snapshot-load -d
 ## Configuration
 
 `~/.config/emunet/state.json`: `proxyPort` (8877), `dnsPort` (53), `upstream` (`auto`),
-`manageEmulators` (`true`). Logs: `$(brew --prefix)/var/log/emunet.log`.
+`manageEmulators` (`true`). Logs: `~/Library/Logs/emunet.log` (Homebrew: `$(brew --prefix)/var/log/emunet.log`).
 
 ## Limitations
 
@@ -115,11 +137,13 @@ Your own scripts can do the same with `emulator -avd <name> -no-snapshot-load -d
 ## Uninstall
 
 ```bash
-emunet mac-dns off     # if you turned it on
-emunet off
-brew services stop emunet
-brew uninstall emunet
+emunet off                      # stop managing emulator proxies
+emunet service uninstall        # also switches the Mac's DNS back to automatic if mac-dns was on
 ```
+
+then remove the command the way you installed it: `brew uninstall emunet`,
+`curl -fsSL https://raw.githubusercontent.com/yunusemreyildiz/emunet/main/install.sh | bash -s -- --uninstall`,
+or `npm uninstall -g emunet`.
 
 ## Development
 

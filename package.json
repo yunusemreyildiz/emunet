@@ -1,0 +1,41 @@
+{
+  "name": "emunet",
+  "version": "0.5.0",
+  "description": "Keep Android emulator and macOS internet working across VPN and debugging-proxy changes",
+  "type": "module",
+  "bin": {
+    "emunet": "emunet.mjs"
+  },
+  "files": [
+    "emunet.mjs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "android",
+    "android-emulator",
+    "macos",
+    "vpn",
+    "dns",
+    "proxy",
+    "proxyman",
+    "charles",
+    "mitmproxy",
+    "network"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yunusemreyildiz/emunet.git"
+  },
+  "homepage": "https://github.com/yunusemreyildiz/emunet#readme",
+  "bugs": "https://github.com/yunusemreyildiz/emunet/issues",
+  "author": "Yunus Emre Yıldız",
+  "license": "MIT"
+}

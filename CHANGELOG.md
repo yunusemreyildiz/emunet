@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+- New install options besides Homebrew: a one-line `curl … | bash` installer and `npm install -g emunet`.
+- `emunet service install|uninstall|status` sets up / removes the login service (LaunchAgent, or
+  `brew services` for Homebrew installs). Uninstalling turns `mac-dns` off first so the Mac keeps DNS.
+- The service runs Node from a stable path, so Node upgrades do not break it.
+
 ## 0.4.0
 - English CLI, logs and docs.
 - Works with any debugging proxy: follows the macOS system proxy, and otherwise auto-detects
