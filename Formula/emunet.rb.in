@@ -14,7 +14,7 @@ class Emunet < Formula
     (bin/"emunet").write <<~EOS
       #!/bin/bash
       export UV_THREADPOOL_SIZE=16
-      exec "#{Formula["node"].opt_bin}/node" "#{libexec}/emunet.mjs" "$@"
+      exec "#{HOMEBREW_PREFIX}/opt/node/bin/node" "#{libexec}/emunet.mjs" "$@"
     EOS
   end
 
