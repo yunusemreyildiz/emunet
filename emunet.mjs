@@ -20,6 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 
 const execFileAsync = promisify(execFile);
 const VERSION = '0.5.0';
@@ -27,11 +28,23 @@ const VERSION = '0.5.0';
 // getaddrinfo runs on libuv's thread pool; a hung VPN resolver must not starve the proxy.
 process.env.UV_THREADPOOL_SIZE ||= '16';
 
-const SERVICE_LABEL = 'local.emunet';
-const SERVICE_PLIST = path.join(os.homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);
-const SERVICE_LOG = path.join(os.homedir(), 'Library', 'Logs', 'emunet.log');
+// EMUNET_CONFIG_DIR / EMUNET_DRY_RUN / EMUNET_DNS_MODEL / EMUNET_FAKE_AGENTS exist for the test suite.
+const CONFIG_DIR = process.env.EMUNET_CONFIG_DIR || path.join(os.homedir(), '.config', 'emunet');
+const DRY_RUN = process.env.EMUNET_DRY_RUN === '1';
 
-const CONFIG_DIR = path.join(os.homedir(), '.config', 'emunet');
+const SERVICE_LABEL = 'local.emunet';
+const SERVICE_PLIST = DRY_RUN
+  ? path.join(process.env.EMUNET_CONFIG_DIR || os.tmpdir(), `${SERVICE_LABEL}.plist`)
+  : path.join(os.homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);
+const SERVICE_LOG = path.join(os.homedir(), 'Library', 'Logs', 'emunet.log');
+const GUARD_LABEL = 'local.emunet.dnsguard';
+const GUARD_PLIST = DRY_RUN
+  ? path.join(process.env.EMUNET_CONFIG_DIR || os.tmpdir(), `${GUARD_LABEL}.plist`)
+  : path.join(os.homedir(), 'Library', 'LaunchAgents', `${GUARD_LABEL}.plist`);
+const HEALTH_NAME = 'emunet-health.invalid';
+const NETWORKSETUP = process.env.EMUNET_NETWORKSETUP || '/usr/sbin/networksetup';
+const HEALTH_ADDRESS = '127.0.0.77';
+
 const STATE_FILE = path.join(CONFIG_DIR, 'state.json');
 const DEFAULTS = {
   proxyPort: 8877,
@@ -65,6 +78,9 @@ function loadState() {
     if (saved.mode === 'direct') saved.upstream = 'none';
     else if (saved.mode === 'upstream' && saved.upstreamPort) saved.upstream = `${saved.upstreamHost || '127.0.0.1'}:${saved.upstreamPort}`;
   }
+  // 0.5 pre-release: single { service, servers } → per-service map.
+  if (saved.macDnsPrevious && !saved.macDns) saved.macDns = { [saved.macDnsPrevious.service]: saved.macDnsPrevious.servers };
+  delete saved.macDnsPrevious;
   delete saved.mode;
   delete saved.upstreamHost;
   delete saved.upstreamPort;
@@ -194,16 +210,28 @@ async function macHasInternet() {
 // Upstream debugging proxy detection
 // ---------------------------------------------------------------------------
 
-async function systemProxy() {
-  const out = await sh('/usr/sbin/scutil', ['--proxy']).catch(() => '');
+export function parseProxySettings(out) {
+  const result = { proxy: null, pac: null, autoDiscovery: /ProxyAutoDiscoveryEnable : 1/.test(out) };
+  if (/ProxyAutoConfigEnable : 1/.test(out)) result.pac = /ProxyAutoConfigURLString : (\S+)/.exec(out)?.[1] || '(no URL)';
   for (const kind of ['HTTPS', 'HTTP']) {
     if (new RegExp(`${kind}Enable : 1`).test(out)) {
       const host = new RegExp(`${kind}Proxy : (\\S+)`).exec(out)?.[1];
       const port = Number(new RegExp(`${kind}Port : (\\d+)`).exec(out)?.[1]);
-      if (host && port) return { host, port };
+      if (host && port) {
+        result.proxy = { host, port };
+        break;
+      }
     }
   }
-  return null;
+  return result;
+}
+
+async function proxySettings() {
+  return parseProxySettings(await sh('/usr/sbin/scutil', ['--proxy']).catch(() => ''));
+}
+
+async function systemProxy() {
+  return (await proxySettings()).proxy;
 }
 
 // Listening TCP sockets with the owning process' full command line.
@@ -293,6 +321,53 @@ function markUpstreamDown() {
 }
 
 // ---------------------------------------------------------------------------
+// Organisation-managed network security (DNS filtering, secure web gateways, ZTNA).
+// When one is present emunet never changes the Mac's DNS or proxy settings, and answers
+// emulator DNS through the system resolver so the company's DNS policy still applies.
+// ---------------------------------------------------------------------------
+
+const SECURITY_AGENTS = [
+  { name: 'Zscaler', match: /zscaler|zstunnel/i },
+  { name: 'Cisco Umbrella / Secure Client', match: /umbrella|acumbrella|acsock|com\.cisco\.anyconnect|cisco secure client/i },
+  { name: 'Netskope', match: /netskope|nsauxiliarysvc|stagentsvc/i },
+  { name: 'Cloudflare WARP / Zero Trust', match: /cloudflare ?warp|com\.cloudflare\.1dot1dot1dot1/i },
+  { name: 'Palo Alto GlobalProtect', match: /globalprotect|pangps|com\.paloaltonetworks/i },
+  { name: 'Forcepoint', match: /forcepoint|websense/i },
+  { name: 'Jamf Trust / Wandera', match: /jamf ?trust|com\.jamf\.trust|wandera/i },
+  { name: 'Check Point Harmony', match: /check ?point|harmony ?(sase|connect)|perimeter ?81/i },
+];
+
+let managedNetwork = { detected: false, agents: [], at: 0 };
+// While the Mac's own DNS points at emunet, the system resolver would loop back to us.
+let macDnsPointsAtUs = false;
+
+export function detectAgents(text) {
+  return SECURITY_AGENTS.filter((agent) => agent.match.test(text)).map((agent) => agent.name);
+}
+
+async function refreshManagedNetwork(force = false) {
+  if (!force && Date.now() - managedNetwork.at < 60000) return managedNetwork;
+  let text;
+  if (process.env.EMUNET_FAKE_AGENTS !== undefined) {
+    text = process.env.EMUNET_FAKE_AGENTS;
+  } else {
+    const [procs, extensions] = await Promise.all([
+      sh('/bin/ps', ['-axo', 'comm=']).catch(() => ''),
+      sh('/usr/bin/systemextensionsctl', ['list']).catch(() => ''),
+    ]);
+    text = `${procs}\n${extensions}`;
+  }
+  const agents = detectAgents(text);
+  managedNetwork = { detected: agents.length > 0, agents, at: Date.now() };
+  return managedNetwork;
+}
+
+function policyMessage() {
+  return `Your organization manages this Mac's network security with ${managedNetwork.agents.join(', ')}. `
+    + 'emunet will not change the Mac\'s DNS or proxy settings. Ask your IT team if you need a change.';
+}
+
+// ---------------------------------------------------------------------------
 // HTTP / CONNECT proxy
 // ---------------------------------------------------------------------------
 
@@ -330,6 +405,10 @@ function connectDirect(req, clientSocket, head) {
   serverSocket.setTimeout(20000, () => serverSocket.destroy(new Error('connect timeout')));
   serverSocket.once('connect', () => {
     serverSocket.setTimeout(0);
+    if (clientSocket.destroyed) {
+      serverSocket.destroy();
+      return;
+    }
     stats.direct += 1;
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     if (head?.length) serverSocket.write(head);
@@ -355,6 +434,10 @@ async function handleConnect(req, clientSocket, head) {
   let connected = false;
   socket.once('connect', () => {
     connected = true;
+    if (clientSocket.destroyed) {
+      socket.destroy();
+      return;
+    }
     stats.viaUpstream += 1;
     socket.write(`CONNECT ${req.url} HTTP/1.1\r\n${rawHeaderBlock(req)}\r\n\r\n`);
     if (head?.length) socket.write(head);
@@ -369,7 +452,14 @@ async function handleConnect(req, clientSocket, head) {
 }
 
 function forwardHttp(req, res, upstream) {
-  const target = new URL(req.url);
+  let target;
+  try {
+    target = new URL(req.url);
+  } catch {
+    res.writeHead(400);
+    res.end('bad request URL\n');
+    return;
+  }
   const options = upstream
     ? { host: upstream.host, port: upstream.port, path: req.url }
     : { host: target.hostname, port: target.port || 80, path: target.pathname + target.search, lookup: emunetLookup };
@@ -416,33 +506,119 @@ async function handleRequest(req, res) {
 // the tunnel and are lost, so every lookup fails while ping still works.
 // ---------------------------------------------------------------------------
 
-const PUBLIC_DNS = ['1.1.1.1', '8.8.8.8'];
-let dnsUpstreams = { vpn: [], dhcp: [], updatedAt: 0 };
+export const PUBLIC_DNS = ['1.1.1.1', '8.8.8.8'];
+
+// Upstream model. Servers are "ip" or "ip:port".
+//   supplemental: per-domain resolvers macOS knows about (VPN match domains, /etc/resolver/*) —
+//                 a query for such a domain goes there first, like mDNSResponder would do.
+//   defaults:     the default resolvers the network services ask for (VPN-provided first).
+//   dhcp:         the DNS the current network handed out (survives a VPN overwriting it).
+//   vpnDomains:   the VPN's own DomainName / SearchDomains — its NXDOMAIN for these is final.
+let dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], vpnDomains: [], public: null, updatedAt: 0 };
+
+function splitServer(server) {
+  const [host, port] = server.split(':');
+  return { host, port: Number(port) || 53 };
+}
+
+// Parse `scutil --dns` (the unscoped section) into resolver blocks.
+export function parseScutilDns(text) {
+  const unscoped = text.split('DNS configuration (for scoped queries)')[0];
+  return unscoped
+    .split(/\n(?=resolver #\d+)/)
+    .filter((block) => block.startsWith('resolver #'))
+    .map((block) => {
+      const port = Number(/^\s*port\s*:\s*(\d+)/m.exec(block)?.[1]) || 53;
+      const servers = [...block.matchAll(/nameserver\[\d+\]\s*:\s*(\S+)/g)]
+        .map((m) => m[1])
+        .filter((ip) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip))
+        .map((ip) => (port === 53 ? ip : `${ip}:${port}`));
+      return {
+        domain: /^\s*domain\s*:\s*(\S+)/m.exec(block)?.[1]?.replace(/\.$/, '').toLowerCase() || null,
+        servers,
+        mdns: /options\s*:.*\bmdns\b/.test(block),
+        ifName: /if_index : \d+ \((\S+)\)/.exec(block)?.[1] || null,
+      };
+    });
+}
+
+function isOwnServer(server) {
+  const { host, port } = splitServer(server);
+  return isLoopback(host) && port === state.dnsPort;
+}
 
 async function refreshDnsUpstreams() {
-  // With the Mac's DNS pointed at 127.0.0.1, `scutil --dns` no longer lists the VPN servers,
-  // so also read the per-service State:/Network/Service/*/DNS keys VPN clients write.
-  const store = await sh('/usr/sbin/scutil', ['--dns']).catch(() => '');
-  const keys = (await scutilRun('list State:/Network/Service/[^/]+/DNS\n')).match(/State:\/Network\/Service\/\S+\/DNS/g) || [];
-  let serviceDns = '';
-  for (const key of keys) serviceDns += await scutilShow(key);
-  const configured = ipv4List([...store.split('\n').filter((line) => line.includes('nameserver')), serviceDns].join(' '));
-  const vpn = [];
-  for (const ip of configured) {
-    if (isTunnelInterface(await routeInterface(ip))) vpn.push(ip);
+  if (process.env.EMUNET_DNS_MODEL) {
+    dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], vpnDomains: [], public: null, ...JSON.parse(process.env.EMUNET_DNS_MODEL), updatedAt: Date.now() };
+    return;
   }
+  const resolvers = parseScutilDns(await sh('/usr/sbin/scutil', ['--dns']).catch(() => ''));
+  const supplemental = resolvers
+    .filter((r) => r.domain && !r.mdns && r.servers.length)
+    .map((r) => ({ domain: r.domain, servers: r.servers.filter((s) => !isOwnServer(s)) }))
+    .filter((r) => r.servers.length);
+
+  // Default resolvers: the service DNS keys without match domains (what VPN clients and DHCP write).
+  // With `mac-dns on` the global default is 127.0.0.1, so it has to come from these keys.
+  const keys = (await scutilRun('list State:/Network/Service/[^/]+/DNS\n')).match(/State:\/Network\/Service\/\S+\/DNS/g) || [];
+  const candidates = [];
+  const domainsByServer = new Map();
+  for (const key of keys) {
+    const dict = await scutilShow(key);
+    if (/SupplementalMatchDomains/.test(dict)) continue;
+    const servers = ipv4List(/ServerAddresses : <array> \{([^}]*)\}/.exec(dict)?.[1] || '');
+    const domains = [
+      /DomainName : (\S+)/.exec(dict)?.[1],
+      ...[...(/SearchDomains : <array> \{([^}]*)\}/.exec(dict)?.[1] || '').matchAll(/\d+ : (\S+)/g)].map((m) => m[1]),
+    ].filter(Boolean).map((d) => d.toLowerCase().replace(/\.$/, ''));
+    for (const server of servers) domainsByServer.set(server, [...(domainsByServer.get(server) || []), ...domains]);
+    candidates.push(...servers);
+  }
+  const globalDefault = resolvers.find((r) => !r.domain)?.servers || [];
+  const all = [...new Set([...candidates, ...globalDefault])].filter((s) => !isOwnServer(s));
+  const vpn = [];
+  for (const server of all) {
+    if (isTunnelInterface(await routeInterface(splitServer(server).host))) vpn.push(server);
+  }
+  const defaults = [...vpn, ...all.filter((s) => !vpn.includes(s))];
   const iface = /PrimaryInterface : (\S+)/.exec(await scutilShow('State:/Network/Global/IPv4'))?.[1] || 'en0';
   const dhcp = ipv4List(await sh('/usr/sbin/ipconfig', ['getoption', iface, 'domain_name_server']).catch(() => ''));
-  // No DHCP DNS (static configuration etc.): use configured servers that are not behind the VPN.
-  const others = configured.filter((ip) => !vpn.includes(ip));
-  dnsUpstreams = { vpn, dhcp: dhcp.length ? dhcp : others, updatedAt: Date.now() };
+  const vpnDomains = [...new Set(vpn.flatMap((server) => domainsByServer.get(server) || []))];
+  dnsModel = { supplemental, defaults, dhcp, vpn, vpnDomains, updatedAt: Date.now() };
+}
+
+function inDomains(name, domains) {
+  const lower = (name || '').toLowerCase().replace(/\.$/, '');
+  return (domains || []).some((d) => lower === d || lower.endsWith(`.${d}`));
+}
+
+function matchSupplemental(name) {
+  const lower = (name || '').toLowerCase().replace(/\.$/, '');
+  return (dnsModel.supplemental || [])
+    .filter((r) => lower === r.domain || lower.endsWith(`.${r.domain}`))
+    .sort((a, b) => b.domain.length - a.domain.length)[0] || null;
+}
+
+// The ordered server list for a name, each tagged with the tier it came from.
+export function serversFor(name) {
+  const out = [];
+  const add = (servers, tier) => {
+    for (const server of servers) if (!out.some((o) => o.server === server)) out.push({ server, tier });
+  };
+  const match = matchSupplemental(name);
+  if (match) add(match.servers, 'match');
+  add(dnsModel.defaults, 'default');
+  add(dnsModel.dhcp, 'dhcp');
+  add(dnsModel.public || PUBLIC_DNS, 'public');
+  return out;
 }
 
 function dnsServerOrder() {
-  return [...new Set([...dnsUpstreams.vpn, ...dnsUpstreams.dhcp, ...PUBLIC_DNS])];
+  return serversFor('').map((s) => s.server);
 }
 
 function forwardUdp(query, server, timeoutMs) {
+  const { host, port } = splitServer(server);
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket('udp4');
     const timer = setTimeout(() => {
@@ -459,13 +635,14 @@ function forwardUdp(query, server, timeoutMs) {
       socket.close();
       reject(error);
     });
-    socket.send(query, 53, server);
+    socket.send(query, port, host);
   });
 }
 
 function forwardTcp(query, server, timeoutMs) {
+  const { host, port } = splitServer(server);
   return new Promise((resolve, reject) => {
-    const socket = net.connect({ host: server, port: 53 });
+    const socket = net.connect({ host, port });
     const chunks = [];
     socket.setTimeout(timeoutMs, () => socket.destroy(new Error('timeout')));
     socket.once('connect', () => {
@@ -482,28 +659,145 @@ function forwardTcp(query, server, timeoutMs) {
       }
     });
     socket.once('error', reject);
+    socket.once('close', () => reject(new Error('closed'))); // no-op if already resolved
   });
 }
 
-async function resolveRaw(query, transport) {
-  for (const server of dnsServerOrder()) {
-    try {
-      const timeout = dnsUpstreams.vpn.includes(server) ? 2500 : 2000;
-      return transport === 'tcp' ? await forwardTcp(query, server, timeout) : await forwardUdp(query, server, timeout);
-    } catch {
-      // try the next server
-    }
+export function queryName(msg) {
+  const labels = [];
+  let offset = 12;
+  while (offset < msg.length && msg[offset] !== 0) {
+    const len = msg[offset];
+    if (len & 0xc0) return null;
+    labels.push(msg.subarray(offset + 1, offset + 1 + len).toString('latin1'));
+    offset += len + 1;
   }
+  return labels.join('.');
+}
+
+const RCODE = { NOERROR: 0, SERVFAIL: 2, NXDOMAIN: 3, NOTIMP: 4, REFUSED: 5 };
+
+// Ask the servers in order. A server that fails, refuses or SERVFAILs is skipped. NXDOMAIN is
+// final when it comes from the resolver that owns the name: a match-domain resolver, or the VPN
+// DNS for the VPN's own domains (otherwise a router that "helpfully" answers unknown names would
+// win). For other names a default resolver's NXDOMAIN is double-checked with the network's own
+// DNS (split-horizon VPN DNS often NXDOMAINs public names), but never with public resolvers, so
+// internal names do not leak to the internet.
+export async function resolveRaw(query, transport = 'udp', { timeoutMs } = {}) {
+  const name = queryName(query);
+  let fallbackNx = null;
+  let nxFromDefault = false;
+  for (const { server, tier } of serversFor(name)) {
+    if (nxFromDefault && tier === 'public') break;
+    let response;
+    try {
+      const timeout = timeoutMs || (dnsModel.vpn.includes(server) ? 2500 : 2000);
+      response = transport === 'tcp' ? await forwardTcp(query, server, timeout) : await forwardUdp(query, server, timeout);
+    } catch {
+      continue;
+    }
+    if (response.length < 12 || response.readUInt16BE(0) !== query.readUInt16BE(0)) continue;
+    const rcode = response[3] & 0x0f;
+    if ([RCODE.SERVFAIL, RCODE.NOTIMP, RCODE.REFUSED].includes(rcode)) continue;
+    const owns = tier === 'match' || (dnsModel.vpn.includes(server) && inDomains(name, dnsModel.vpnDomains));
+    if (rcode === RCODE.NXDOMAIN && !owns) {
+      fallbackNx ||= response;
+      if (tier === 'default') nxFromDefault = true;
+      continue;
+    }
+    return response;
+  }
+  if (fallbackNx) return fallbackNx;
   throw new Error('no DNS server answered');
 }
 
-function buildQuery(name) {
+// When the organisation runs a DNS/network security agent, answer from the system resolver
+// instead of talking to DNS servers directly, so the company's DNS policy still applies.
+async function resolveViaSystem(query) {
+  const name = queryName(query);
+  const type = query.readUInt16BE(12 + (name ? name.length + 2 : 1));
+  const header = Buffer.from(query.subarray(0, 12));
+  header[2] = 0x80 | (query[2] & 0x79);
+  const question = query.subarray(12, 12 + (name ? name.length + 2 : 1) + 4);
+  if (type !== 1) {
+    header[3] = 0x80;
+    header.writeUInt16BE(1, 4);
+    header.writeUInt16BE(0, 6);
+    header.writeUInt16BE(0, 8);
+    header.writeUInt16BE(0, 10);
+    return Buffer.concat([header, question]);
+  }
+  const addresses = await withTimeout(
+    new Promise((resolve) => dns.lookup(name, { all: true, family: 4 }, (error, list) => resolve(error ? error : list.map((a) => a.address)))),
+    5000,
+    new Error('timeout'),
+  );
+  if (addresses instanceof Error) {
+    header[3] = 0x80 | (['ENOTFOUND', 'ENODATA'].includes(addresses.code) ? RCODE.NXDOMAIN : RCODE.SERVFAIL);
+    header.writeUInt16BE(1, 4);
+    header.writeUInt16BE(0, 6);
+    header.writeUInt16BE(0, 8);
+    header.writeUInt16BE(0, 10);
+    return Buffer.concat([header, question]);
+  }
+  header[3] = 0x80;
+  header.writeUInt16BE(1, 4);
+  header.writeUInt16BE(addresses.length, 6);
+  header.writeUInt16BE(0, 8);
+  header.writeUInt16BE(0, 10);
+  const answers = addresses.map((address) => {
+    const answer = Buffer.alloc(16);
+    answer.writeUInt16BE(0xc00c, 0);
+    answer.writeUInt16BE(1, 2);
+    answer.writeUInt16BE(1, 4);
+    answer.writeUInt32BE(30, 6);
+    answer.writeUInt16BE(4, 10);
+    address.split('.').forEach((octet, i) => {
+      answer[12 + i] = Number(octet);
+    });
+    return answer;
+  });
+  return Buffer.concat([header, question, ...answers]);
+}
+
+function healthAnswer(query) {
+  const name = queryName(query);
+  const question = query.subarray(12, 12 + name.length + 2 + 4);
+  const header = Buffer.from(query.subarray(0, 12));
+  header[2] = 0x80 | (query[2] & 0x79);
+  header[3] = 0x80;
+  header.writeUInt16BE(1, 4);
+  header.writeUInt16BE(1, 6);
+  header.writeUInt16BE(0, 8);
+  header.writeUInt16BE(0, 10);
+  const answer = Buffer.alloc(16);
+  answer.writeUInt16BE(0xc00c, 0);
+  answer.writeUInt16BE(1, 2);
+  answer.writeUInt16BE(1, 4);
+  answer.writeUInt32BE(0, 6);
+  answer.writeUInt16BE(4, 10);
+  HEALTH_ADDRESS.split('.').forEach((octet, i) => {
+    answer[12 + i] = Number(octet);
+  });
+  return Buffer.concat([header, question, answer]);
+}
+
+async function answerQuery(query, transport) {
+  if (queryName(query)?.toLowerCase() === HEALTH_NAME) return healthAnswer(query);
+  if (managedNetwork.detected && !macDnsPointsAtUs) return resolveViaSystem(query);
+  return resolveRaw(query, transport);
+}
+
+export function buildQuery(name, type = 1) {
   const header = Buffer.alloc(12);
   header.writeUInt16BE(Math.floor(Math.random() * 0xffff), 0);
   header.writeUInt16BE(0x0100, 2); // RD
   header.writeUInt16BE(1, 4);
   const labels = name.split('.').filter(Boolean).map((label) => Buffer.concat([Buffer.from([label.length]), Buffer.from(label)]));
-  return Buffer.concat([header, ...labels, Buffer.from([0, 0, 1, 0, 1])]);
+  const tail = Buffer.alloc(5);
+  tail.writeUInt16BE(type, 1);
+  tail.writeUInt16BE(1, 3);
+  return Buffer.concat([header, ...labels, tail]);
 }
 
 function skipName(msg, offset) {
@@ -516,7 +810,7 @@ function skipName(msg, offset) {
   return offset;
 }
 
-function parseARecords(msg) {
+export function parseARecords(msg) {
   const questions = msg.readUInt16BE(4);
   const answers = msg.readUInt16BE(6);
   let offset = 12;
@@ -542,6 +836,7 @@ function emunetLookup(hostname, options, callback) {
     const result = { address: hostname, family: net.isIP(hostname) };
     return opts.all ? cb(null, [result]) : cb(null, result.address, result.family);
   }
+  if (managedNetwork.detected && !macDnsPointsAtUs) return dns.lookup(hostname, opts, cb);
   resolveRaw(buildQuery(hostname), 'udp')
     .then((response) => {
       const addresses = parseARecords(response);
@@ -562,12 +857,28 @@ function servfail(query) {
   return response;
 }
 
+let dnsListening = false;
+
 function startDns() {
   refreshDnsUpstreams().catch(() => {});
+  bindDns();
+}
+
+// If port 53 is taken (dnsmasq, AdGuard…), keep the proxy running and retry every 30 s.
+function bindDns(attempt = 0) {
+  const retry = (what, error) => {
+    if (attempt === 0) log(`cannot listen for DNS (${what}) on :${state.dnsPort} (${error.code || error.message}); proxy keeps running, retrying every 30 s`);
+    setTimeout(() => bindDns(attempt + 1), 30000).unref?.();
+  };
   const udp = dgram.createSocket('udp4');
+  let bound = false;
   udp.on('error', (error) => {
-    log(`DNS disabled: cannot listen on :${state.dnsPort} (${error.code || error.message})`);
-    udp.close();
+    if (!bound) {
+      udp.close();
+      retry('udp', error);
+      return;
+    }
+    log(`DNS socket error: ${error.code || error.message}`);
   });
   udp.on('message', async (msg, rinfo) => {
     // Bound to 0.0.0.0 (macOS only lets non-root processes bind :53 that way); never answer the LAN.
@@ -575,43 +886,51 @@ function startDns() {
     stats.dnsQueries += 1;
     let response;
     try {
-      response = await resolveRaw(msg, 'udp');
+      response = await answerQuery(msg, 'udp');
     } catch {
       stats.dnsFail += 1;
       response = servfail(msg);
     }
-    udp.send(response, rinfo.port, rinfo.address);
+    udp.send(response, rinfo.port, rinfo.address, () => {});
   });
-  udp.bind(state.dnsPort, '0.0.0.0', () => log(`DNS forwarder listening on :${state.dnsPort} udp+tcp (loopback clients only)`));
-
-  const tcp = net.createServer((socket) => {
-    if (!isLoopback(socket.remoteAddress || '')) {
-      socket.destroy();
-      return;
-    }
-    let buffer = Buffer.alloc(0);
-    socket.on('error', () => {});
-    socket.on('data', async (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      while (buffer.length >= 2 && buffer.length >= 2 + buffer.readUInt16BE(0)) {
-        const query = buffer.subarray(2, 2 + buffer.readUInt16BE(0));
-        buffer = buffer.subarray(2 + query.length);
-        stats.dnsQueries += 1;
-        let response;
-        try {
-          response = await resolveRaw(query, 'tcp');
-        } catch {
-          stats.dnsFail += 1;
-          response = servfail(query);
-        }
-        const length = Buffer.alloc(2);
-        length.writeUInt16BE(response.length);
-        if (socket.writable) socket.write(Buffer.concat([length, response]));
+  udp.bind(state.dnsPort, '0.0.0.0', () => {
+    bound = true;
+    const tcp = net.createServer((socket) => {
+      if (!isLoopback(socket.remoteAddress || '')) {
+        socket.destroy();
+        return;
       }
+      let buffer = Buffer.alloc(0);
+      socket.on('error', () => {});
+      socket.on('data', async (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        while (buffer.length >= 2 && buffer.length >= 2 + buffer.readUInt16BE(0)) {
+          const query = buffer.subarray(2, 2 + buffer.readUInt16BE(0));
+          buffer = buffer.subarray(2 + query.length);
+          if (query.length < 12) continue;
+          stats.dnsQueries += 1;
+          let response;
+          try {
+            response = await answerQuery(query, 'tcp');
+          } catch {
+            stats.dnsFail += 1;
+            response = servfail(query);
+          }
+          const length = Buffer.alloc(2);
+          length.writeUInt16BE(response.length);
+          if (socket.writable) socket.write(Buffer.concat([length, response]));
+        }
+      });
+    });
+    tcp.on('error', (error) => {
+      // UDP works; DNS over TCP (large answers) is unavailable. Log it, keep UDP.
+      log(`cannot listen for DNS (tcp) on :${state.dnsPort} (${error.code || error.message}); UDP DNS keeps working`);
+    });
+    tcp.listen(state.dnsPort, '0.0.0.0', () => {
+      dnsListening = true;
+      log(`DNS forwarder listening on :${state.dnsPort} udp+tcp (loopback clients only)`);
     });
   });
-  tcp.on('error', (error) => log(`DNS (tcp) disabled: ${error.code || error.message}`));
-  tcp.listen(state.dnsPort, '0.0.0.0');
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +976,15 @@ async function emulatorProcesses() {
   }
 }
 
+async function bootedSimulators() {
+  const out = await sh('/usr/bin/xcrun', ['simctl', 'list', 'devices', 'booted', '-j'], 10000).catch(() => '');
+  try {
+    return Object.values(JSON.parse(out).devices || {}).flat().filter((d) => d.state === 'Booted').map((d) => d.name);
+  } catch {
+    return [];
+  }
+}
+
 async function emulatorAvdName(serial) {
   return (await adb(serial, 'emu', 'avd', 'name').catch(() => '')).split('\n')[0].trim();
 }
@@ -674,6 +1002,10 @@ async function emulatorResolves(serial) {
 }
 
 async function kickWifi(serial, reason) {
+  if (DRY_RUN) {
+    console.log(`   [dry-run] adb -s ${serial} shell svc wifi disable/enable`);
+    return;
+  }
   log(`${serial}: restarting Wi-Fi to re-run network validation (${reason})`);
   await adb(serial, 'shell', 'svc', 'wifi', 'disable').catch(() => {});
   await sleep(2500);
@@ -719,6 +1051,10 @@ function describeUpstream(upstream) {
 async function superviseTick() {
   state = loadState();
   await refreshDnsUpstreams().catch(() => {});
+  await refreshManagedNetwork().catch(() => {});
+  const primary = await primaryService().catch(() => null);
+  macDnsPointsAtUs = primary?.dnsServers.includes('127.0.0.1') || false;
+  await syncGuard(primary).catch((error) => log(`mac-dns watchdog: ${error.message}`));
   await refreshUpstream();
   const vpn = vpnInterfaces().join(',') || 'none';
   const upstream = describeUpstream(await activeUpstream());
@@ -738,12 +1074,26 @@ async function superviseTick() {
 // ---------------------------------------------------------------------------
 
 async function primaryService() {
+  if (process.env.EMUNET_FAKE_SERVICE) return JSON.parse(process.env.EMUNET_FAKE_SERVICE);
   const uuid = /PrimaryService : (\S+)/.exec(await scutilShow('State:/Network/Global/IPv4'))?.[1];
   if (!uuid) return null;
   const name = /UserDefinedName : (.+)/.exec(await scutilShow(`Setup:/Network/Service/${uuid}`))?.[1]?.trim();
   if (!name) return null;
-  const current = await sh('/usr/sbin/networksetup', ['-getdnsservers', name]).catch(() => '');
-  return { name, dnsServers: ipv4List(current).concat(current.includes('127.0.0.1') ? ['127.0.0.1'] : []) };
+  return { name, dnsServers: await serviceDnsServers(name) };
+}
+
+// The manual DNS servers of a network service, IPv4 and IPv6, exactly as configured ([] = automatic).
+export function parseDnsServersOutput(out) {
+  return out.split('\n').map((line) => line.trim()).filter((line) => /^(\d{1,3}(\.\d{1,3}){3}|[0-9a-f:]*:[0-9a-f:.]*(%\w+)?)$/i.test(line));
+}
+
+async function serviceDnsServers(name) {
+  if (process.env.EMUNET_FAKE_SERVICE) {
+    const fake = JSON.parse(process.env.EMUNET_FAKE_SERVICE) || {};
+    if (fake.name === name) return fake.dnsServers;
+    return (fake.others || {})[name] || [];
+  }
+  return parseDnsServersOutput(await sh(NETWORKSETUP, ['-getdnsservers', name]).catch(() => ''));
 }
 
 async function statusSnapshot() {
@@ -765,8 +1115,10 @@ async function statusSnapshot() {
     emulators,
     emulatorProcesses: await emulatorProcesses(),
     dnsServers: dnsServerOrder(),
-    vpnDns: dnsUpstreams.vpn,
+    vpnDns: dnsModel.vpn,
     mac: await primaryService(),
+    managedNetwork: (await refreshManagedNetwork()).agents,
+    dnsGuard: await guardLoaded(),
     stats,
   };
 }
@@ -796,6 +1148,10 @@ async function fetchStatus() {
 // ---------------------------------------------------------------------------
 
 async function privileged(cmd, args) {
+  if (DRY_RUN) {
+    console.log(`   [dry-run] ${path.basename(cmd)} ${args.join(' ')}`);
+    return true;
+  }
   try {
     await execFileAsync(cmd, args, { timeout: 15000 });
     return true;
@@ -805,30 +1161,201 @@ async function privileged(cmd, args) {
   }
 }
 
+// Does anything at all answer DNS on 127.0.0.1:53?
+async function anyDnsOn127() {
+  try {
+    await forwardUdp(buildQuery('apple.com'), `127.0.0.1:${state.dnsPort}`, 2500);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Is it really emunet that answers DNS on 127.0.0.1:53?
+async function emunetDnsAnswering(timeoutMs = 3000) {
+  try {
+    const response = await forwardUdp(buildQuery(HEALTH_NAME), `127.0.0.1:${state.dnsPort}`, timeoutMs);
+    return parseARecords(response).includes(HEALTH_ADDRESS);
+  } catch {
+    return false;
+  }
+}
+
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+// A tiny watchdog that does not depend on Node or emunet: if the Mac's DNS points at 127.0.0.1
+// and nothing answers there for ~10 s (emunet crashed, was uninstalled, port taken…), it puts
+// the previous DNS setting back. It removes itself once emunet is gone for good.
+export function guardScript({ services, dnsPort, networksetup = '/usr/sbin/networksetup', dig = '/usr/bin/dig', script, log }) {
+  const entries = Object.entries(services);
+  return [
+    `ns=${shQuote(networksetup)}`,
+    // Only emunet answers this name (with 127.0.0.77), and it never needs the network.
+    `alive() { ${shQuote(dig)} +time=2 +tries=1 +short @127.0.0.1 -p ${dnsPort} ${HEALTH_NAME} 2>/dev/null | grep -q '^127\\.0\\.0\\.77$'; }`,
+    'onus() { "$ns" -getdnsservers "$1" 2>/dev/null | grep -qx "127.0.0.1"; }',
+    'restore() {',
+    '  svc=$1; shift',
+    '  onus "$svc" || return 0',
+    `  "$ns" -setdnsservers "$svc" "$@" && echo "$(date '+%F %T') dnsguard: emunet DNS not answering on 127.0.0.1:${dnsPort}; restored $svc DNS to $*" >> ${shQuote(log)}`,
+    '}',
+    'need=0',
+    ...entries.map(([name]) => `onus ${shQuote(name)} && need=1`),
+    '[ "$need" = 1 ] || exit 0',
+    'alive && exit 0',
+    'sleep 5',
+    'alive && exit 0',
+    ...entries.map(([name, previous]) => `restore ${shQuote(name)} ${previous.map(shQuote).join(' ')}`),
+    // emunet uninstalled: remove the plist first (bootout ends this very script).
+    `[ -e ${shQuote(script)} ] || { rm -f ${shQuote(GUARD_PLIST)}; /bin/launchctl bootout "gui/$(id -u)/${GUARD_LABEL}" 2>/dev/null; }`,
+    'exit 0',
+  ].join('\n');
+}
+
+function guardPlist(body) {
+  const esc = (value) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${GUARD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/sh</string><string>-c</string><string>${esc(body)}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>20</integer>
+</dict>
+</plist>
+`;
+}
+
+function guardBody(services) {
+  return guardScript({
+    services,
+    dnsPort: state.dnsPort,
+    networksetup: process.env.EMUNET_GUARD_NETWORKSETUP || NETWORKSETUP,
+    script: scriptPath(),
+    log: SERVICE_LOG,
+  });
+}
+
+// Run by the daemon: adopt a Mac DNS that already points at emunet (e.g. enabled by an older
+// version) and keep the watchdog script current, so upgrades never leave an outdated watchdog.
+async function syncGuard(primary) {
+  let changed = { ...(state.macDns || {}) };
+  if (primary?.dnsServers.includes('127.0.0.1') && !changed[primary.name]) {
+    changed[primary.name] = ['Empty'];
+    state = saveState({ macDns: changed });
+    log(`mac-dns: ${primary.name} points at emunet; tracking it (restore = automatic)`);
+  }
+  if (!Object.keys(changed).length) return;
+  const wanted = guardPlist(guardBody(changed));
+  const current = fs.existsSync(GUARD_PLIST) ? fs.readFileSync(GUARD_PLIST, 'utf8') : '';
+  if (current !== wanted) {
+    await installGuard(changed);
+    log('mac-dns watchdog installed/updated');
+  }
+}
+
+async function installGuard(services) {
+  const body = guardScript({
+    services,
+    dnsPort: state.dnsPort,
+    networksetup: process.env.EMUNET_GUARD_NETWORKSETUP || NETWORKSETUP,
+    script: scriptPath(),
+    log: SERVICE_LOG,
+  });
+  fs.mkdirSync(path.dirname(GUARD_PLIST), { recursive: true });
+  fs.writeFileSync(GUARD_PLIST, guardPlist(body));
+  if (DRY_RUN) return;
+  const uid = process.getuid();
+  await execFileAsync('/bin/launchctl', ['bootout', `gui/${uid}/${GUARD_LABEL}`]).catch(() => {});
+  await sleep(300);
+  await execFileAsync('/bin/launchctl', ['bootstrap', `gui/${uid}`, GUARD_PLIST]).catch(() => {});
+}
+
+async function removeGuard() {
+  if (!DRY_RUN) await execFileAsync('/bin/launchctl', ['bootout', `gui/${process.getuid()}/${GUARD_LABEL}`]).catch(() => {});
+  fs.rmSync(GUARD_PLIST, { force: true });
+}
+
+async function guardLoaded() {
+  if (DRY_RUN) return fs.existsSync(GUARD_PLIST);
+  return execFileAsync('/bin/launchctl', ['print', `gui/${process.getuid()}/${GUARD_LABEL}`]).then(() => true, () => false);
+}
+
+let macDnsError = '';
+
+// `on`: points the primary service's DNS at emunet, remembering its previous setting per service.
+// Done WITHOUT sudo on purpose: if this user cannot change DNS unprivileged, neither can the
+// watchdog, so it could never undo the change — refuse instead.
+// `off`: restores every service emunet changed, exactly as it was. Services emunet did not change
+// are never touched.
 async function setMacDns(on) {
-  const service = await primaryService();
-  if (!service) throw new Error('No primary network service found.');
-  const ok = await privileged('/usr/sbin/networksetup', ['-setdnsservers', service.name, on ? '127.0.0.1' : 'Empty']);
-  if (ok) await execFileAsync('/usr/bin/dscacheutil', ['-flushcache']).catch(() => {});
-  return ok;
+  macDnsError = '';
+  const service = await primaryService().catch(() => null);
+  const changed = { ...(state.macDns || {}) };
+  if (on) {
+    if (!service) throw new Error('No primary network service found.');
+    if (!service.dnsServers.includes('127.0.0.1')) {
+      const previous = service.dnsServers.length ? service.dnsServers : ['Empty'];
+      if (DRY_RUN) {
+        console.log(`   [dry-run] networksetup -setdnsservers ${service.name} 127.0.0.1`);
+      } else {
+        try {
+          await execFileAsync(NETWORKSETUP, ['-setdnsservers', service.name, '127.0.0.1'], { timeout: 15000 });
+        } catch {
+          macDnsError = 'This account cannot change DNS settings without an administrator password, so the safety '
+            + 'watchdog would not be able to undo it. Not enabling mac-dns; use an administrator account.';
+          return false;
+        }
+      }
+      changed[service.name] = previous;
+      state = saveState({ macDns: changed });
+    } else if (!changed[service.name]) {
+      changed[service.name] = ['Empty']; // already 127.0.0.1 before emunet tracked it
+      state = saveState({ macDns: changed });
+    }
+    await installGuard(changed);
+  } else {
+    // An untracked 127.0.0.1 (older emunet, deleted state file) is ours if emunet answers there,
+    // or if nothing answers at all (dead DNS must be restored). If another program answers DNS
+    // normally there (dnsmasq, AdGuard…), it is the user's own setup: leave it.
+    if (service && !changed[service.name] && service.dnsServers.length === 1 && service.dnsServers[0] === '127.0.0.1'
+      && ((await emunetDnsAnswering()) || !(await anyDnsOn127()))) {
+      changed[service.name] = ['Empty'];
+    }
+    let ok = true;
+    for (const [name, previous] of Object.entries(changed)) {
+      if (!(await serviceDnsServers(name)).includes('127.0.0.1')) continue; // user changed it since
+      if (!(await privileged(NETWORKSETUP, ['-setdnsservers', name, ...previous]))) ok = false;
+    }
+    if (!ok) return false;
+    await removeGuard();
+    state = saveState({ macDns: {} });
+  }
+  if (!DRY_RUN) await execFileAsync('/usr/bin/dscacheutil', ['-flushcache']).catch(() => {});
+  return true;
+}
+
+function macDnsSummary() {
+  const entries = Object.entries(state.macDns || {});
+  return entries.length ? entries.map(([name, prev]) => `${name}: ${prev.join(' ').replace('Empty', 'automatic')}`).join(', ') : 'automatic';
 }
 
 async function setSystemProxyOff() {
   const service = await primaryService();
   if (!service) return false;
-  const http1 = await privileged('/usr/sbin/networksetup', ['-setwebproxystate', service.name, 'off']);
-  const https1 = await privileged('/usr/sbin/networksetup', ['-setsecurewebproxystate', service.name, 'off']);
+  const http1 = await privileged(NETWORKSETUP, ['-setwebproxystate', service.name, 'off']);
+  const https1 = await privileged(NETWORKSETUP, ['-setsecurewebproxystate', service.name, 'off']);
   return http1 && https1;
 }
 
 async function startDaemon() {
   if (isBrewInstall()) {
     await execFileAsync('brew', ['services', 'restart', 'emunet']).catch(() => {});
-  } else if (fs.existsSync(SERVICE_PLIST)) {
-    const uid = process.getuid();
-    await execFileAsync('/bin/launchctl', ['bootstrap', `gui/${uid}`, SERVICE_PLIST]).catch(() => {});
-    await execFileAsync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/${SERVICE_LABEL}`]).catch(() => {});
   } else {
+    // Rewrites the LaunchAgent, so a Node that moved (nvm, upgrades) is picked up again.
     await installService({ quiet: true });
   }
   return waitForDaemon();
@@ -848,7 +1375,7 @@ async function waitForDaemon() {
 // ---------------------------------------------------------------------------
 
 function scriptPath() {
-  return fs.realpathSync(process.argv[1]);
+  return fs.realpathSync(fileURLToPath(import.meta.url));
 }
 
 function isBrewInstall() {
@@ -895,10 +1422,15 @@ function plistXml(node, script) {
 }
 
 async function launchAgentLoaded() {
+  if (DRY_RUN) return fs.existsSync(SERVICE_PLIST);
   return execFileAsync('/bin/launchctl', ['print', `gui/${process.getuid()}/${SERVICE_LABEL}`]).then(() => true, () => false);
 }
 
 async function bootoutAgent() {
+  if (DRY_RUN) {
+    console.log(`   [dry-run] launchctl bootout gui/${process.getuid()}/${SERVICE_LABEL}`);
+    return;
+  }
   await execFileAsync('/bin/launchctl', ['bootout', `gui/${process.getuid()}/${SERVICE_LABEL}`]).catch(() => {});
   // bootout returns before the job is gone; bootstrapping too early fails with error 5.
   for (let i = 0; i < 50 && (await launchAgentLoaded()); i += 1) await sleep(200);
@@ -913,6 +1445,10 @@ async function installService({ quiet = false } = {}) {
   fs.mkdirSync(path.dirname(SERVICE_PLIST), { recursive: true });
   fs.mkdirSync(path.dirname(SERVICE_LOG), { recursive: true });
   fs.writeFileSync(SERVICE_PLIST, plistXml(stableNode(), scriptPath()));
+  if (DRY_RUN) {
+    console.log(`   [dry-run] launchctl bootstrap ${SERVICE_PLIST}`);
+    return true;
+  }
   await bootoutAgent();
   let loaded = false;
   for (let i = 0; i < 4 && !loaded; i += 1) {
@@ -927,12 +1463,12 @@ async function installService({ quiet = false } = {}) {
 }
 
 async function uninstallService() {
-  const service = await primaryService();
-  if (service?.dnsServers.includes('127.0.0.1')) {
-    console.log('The Mac\'s DNS points at emunet; switching it back to automatic first.');
+  const primary = await primaryService().catch(() => null);
+  if (Object.keys(state.macDns || {}).length || primary?.dnsServers.includes('127.0.0.1')) {
+    console.log('Restoring the Mac\'s DNS before removing the service.');
     await setMacDns(false);
   }
-  if (isBrewInstall()) {
+  if (isBrewInstall() && !DRY_RUN) {
     spawnSync('brew', ['services', 'stop', 'emunet'], { stdio: 'inherit' });
   }
   await bootoutAgent();
@@ -1023,6 +1559,12 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
     return;
   }
 
+  // 1b. Organisation-managed network security
+  await refreshManagedNetwork(true);
+  if (managedNetwork.detected) {
+    say(null, `Managed network security: ${managedNetwork.agents.join(', ')} — emunet will not change the Mac's DNS or proxy settings (company policy).`);
+  }
+
   // 2. emunet service
   const service = await primaryService();
   const macDnsOnEmunet = !!service?.dnsServers.includes('127.0.0.1');
@@ -1041,6 +1583,45 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
     }
   }
 
+  // 2b. emunet's DNS forwarder and the mac-dns watchdog
+  if (daemonUp) {
+    const answering = await emunetDnsAnswering();
+    let owner = '';
+    if (!answering) {
+      const out = await sh('/usr/sbin/lsof', ['+c', '0', '-nP', '-iUDP:' + state.dnsPort]).catch(() => '');
+      owner = out.split('\n')[1]?.trim().split(/\s+/)[0] || '';
+    }
+    say(answering, `emunet DNS on 127.0.0.1:${state.dnsPort}: ${answering ? 'answering' : `NOT ANSWERING${owner ? ` (port held by ${owner})` : ''}`}`);
+    if (!answering) {
+      problems += 1;
+      if (macDnsOnEmunet && fix) {
+        doing('the Mac\'s DNS points at emunet but it cannot answer; restoring the previous DNS setting');
+        if (await setMacDns(false)) fixed += 1;
+      } else if (!macDnsOnEmunet) {
+        console.log('  Emulator DNS (-dns-server 127.0.0.1) will not work and `emunet mac-dns on` is refused until this is solved.');
+      }
+    }
+  }
+  if (macDnsOnEmunet && managedNetwork.detected) {
+    problems += 1;
+    say(false, 'The Mac\'s DNS points at emunet, but this Mac is under managed network security.');
+    if (fix) {
+      doing('restoring the previous DNS setting to comply with company policy');
+      if (await setMacDns(false)) fixed += 1;
+    }
+  } else if (macDnsOnEmunet) {
+    const guarded = await guardLoaded();
+    say(guarded, `mac-dns watchdog: ${guarded ? 'active' : 'MISSING — if emunet stops, the Mac has no DNS'}`);
+    if (!guarded) {
+      problems += 1;
+      if (fix) {
+        await installGuard(Object.keys(state.macDns || {}).length ? state.macDns : { [service.name]: ['Empty'] });
+        doing('watchdog installed');
+        fixed += 1;
+      }
+    }
+  }
+
   // 3. Mac DNS
   await refreshDnsUpstreams().catch(() => {});
   const vpn = vpnInterfaces();
@@ -1052,9 +1633,9 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
     const direct = await directDnsWorks();
     const routes = await Promise.all(resolver.servers.map(async (ip) => [ip, await routeInterface(ip)]));
     const viaTunnel = routes.filter(([, iface]) => isTunnelInterface(iface)).map(([ip]) => ip);
-    const stale = resolver.servers.filter((ip) => !dnsUpstreams.dhcp.includes(ip));
+    const stale = resolver.servers.filter((ip) => !dnsModel.dhcp.includes(ip));
     let reason;
-    if (!vpn.length && dnsUpstreams.dhcp.length && resolver.servers.length && stale.length === resolver.servers.length) {
+    if (!vpn.length && dnsModel.dhcp.length && resolver.servers.length && stale.length === resolver.servers.length) {
       reason = 'the VPN disconnected but its DNS servers were left behind (the VPN client did not restore them)';
     } else if (viaTunnel.length && resolver.ifName && !isTunnelInterface(resolver.ifName)) {
       reason = `the VPN's DNS (${viaTunnel.join(', ')}) is bound to ${resolver.ifName}, so queries leave outside the tunnel and are lost`;
@@ -1064,20 +1645,33 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
       reason = 'the configured DNS servers do not answer';
     }
     console.log(`  Cause: ${reason}. Direct DNS (1.1.1.1 / 8.8.8.8): ${direct ? 'works' : 'also failing'}.`);
-    if (fix && daemonUp) {
+    if (managedNetwork.detected) {
+      console.log(`  ${policyMessage()}`);
+    } else if (fix && daemonUp && !(await emunetDnsAnswering())) {
+      doing('cannot point the Mac\'s DNS at emunet: its DNS forwarder is not answering (see above)');
+    } else if (fix && daemonUp) {
       doing('pointing the Mac\'s DNS at emunet (127.0.0.1); it picks the right server whether the VPN is up or not');
-      if (await setMacDns(true)) {
+      if (!(await setMacDns(true))) {
+        if (macDnsError) console.log(`  ${macDnsError}`);
+      } else {
         sysDns = await systemDnsWorks();
         say(sysDns, `Mac DNS after fix: ${sysDns ? 'working' : 'still broken'}`);
         if (sysDns) fixed += 1;
       }
     }
-  } else if (!macDnsOnEmunet && vpn.length) {
+  } else if (!macDnsOnEmunet && vpn.length && !managedNetwork.detected) {
     say(null, 'Mac DNS works now but is unprotected: VPN + proxy changes can break it. Permanent fix: emunet mac-dns on');
   }
 
   // 4. System proxy
-  const proxy = await systemProxy();
+  const proxyInfo = await proxySettings();
+  const proxy = proxyInfo.proxy;
+  if (proxyInfo.pac) {
+    say(null, `Proxy auto-config (PAC) is set: ${proxyInfo.pac}. emunet does not evaluate PAC files; if emulators must use that proxy, run: emunet upstream host:port`);
+  }
+  if (proxyInfo.autoDiscovery) {
+    say(null, 'Proxy auto-discovery (WPAD) is on. emunet does not use it; set `emunet upstream host:port` if your network needs a proxy.');
+  }
   if (proxy) {
     const listening = await probeTcp(proxy.host, proxy.port, 800);
     const works = listening && (await proxyConnectWorks(proxy.host, proxy.port));
@@ -1086,12 +1680,14 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
     say(works, `System proxy ${label}: ${works ? 'working' : listening ? 'listening but not passing traffic' : 'DEAD — browsers cannot load anything'}`);
     if (!works) {
       problems += 1;
-      if (fix) {
+      if (fix && managedNetwork.detected) {
+        console.log(`  ${policyMessage()}`);
+      } else if (fix) {
         doing('turning the system proxy off (your proxy tool turns it back on when it starts)');
         if (await setSystemProxyOff()) fixed += 1;
       }
     }
-  } else {
+  } else if (!proxyInfo.pac) {
     say(true, 'System proxy: off (direct)');
   }
 
@@ -1103,7 +1699,8 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
 
   // 6. Emulators
   const procs = await emulatorProcesses();
-  for (const serial of await listEmulators()) {
+  const emulatorSerials = process.env.EMUNET_NO_EMULATORS === '1' ? [] : await listEmulators();
+  for (const serial of emulatorSerials) {
     const avdName = await emulatorAvdName(serial);
     const proc = procs.find((p) => p.avd === avdName) || null;
     const wanted = `10.0.2.2:${state.proxyPort}`;
@@ -1144,6 +1741,17 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
     }
   }
 
+  // 7. iOS Simulator (shares the Mac's network stack)
+  const sims = await bootedSimulators();
+  if (sims.length) {
+    say(null, `iOS Simulator: ${sims.join(', ')} — uses the Mac's network, so the Mac DNS / proxy checks above cover it.`);
+    const owner = proxy ? (await listeningProcesses()).find((l) => l.port === proxy.port) : null;
+    const tool = owner && toolNameFor(owner);
+    if (tool) {
+      say(null, `iOS Simulator traffic goes through ${tool} (system proxy): apps that pin TLS certificates will fail unless SSL proxying is disabled for their domains in ${tool}.`);
+    }
+  }
+
   console.log('');
   if (!problems) console.log('No problems found.');
   else if (!fix) console.log(`${problems} problem(s) found. To repair: emunet fix`);
@@ -1159,6 +1767,10 @@ function runDaemon() {
   const server = http.createServer(handleRequest);
   server.on('connect', handleConnect);
   server.on('clientError', (_error, socket) => socket.destroy());
+  server.on('error', (error) => {
+    log(`cannot listen on 127.0.0.1:${state.proxyPort} (${error.code || error.message}); exiting so launchd retries`);
+    process.exit(1);
+  });
   server.listen(state.proxyPort, '127.0.0.1', () => {
     log(`emunet ${VERSION} proxy on 127.0.0.1:${state.proxyPort} (upstream: ${state.upstream})`);
   });
@@ -1190,6 +1802,8 @@ async function cmdStatus() {
   console.log(`VPN: ${status.vpn.length ? status.vpn.join(', ') : 'not connected'}`);
   const macOn = status.mac?.dnsServers.includes('127.0.0.1');
   console.log(`Mac DNS (${status.mac?.name || '?'}): ${macOn ? 'emunet (127.0.0.1) — protected' : `${status.mac?.dnsServers.join(', ') || 'automatic'} — unprotected (emunet mac-dns on)`}`);
+  if (status.managedNetwork.length) console.log(`Managed network security: ${status.managedNetwork.join(', ')} (emunet leaves Mac settings alone; emulator DNS uses the system resolver)`);
+  if (macOn) console.log(`mac-dns watchdog: ${status.dnsGuard ? 'active' : 'MISSING (run emunet fix)'}`);
   console.log(`DNS server order: ${status.dnsServers.join(' → ')}${status.vpnDns.length ? `  (VPN DNS: ${status.vpnDns.join(', ')})` : ''}`);
   for (const emulator of status.emulators) {
     console.log(`${emulator.serial}: http_proxy=${emulator.httpProxy}  validated=${yesNo(emulator.wifiValidated)}`);
@@ -1261,14 +1875,30 @@ async function cmdMacDns(value) {
     process.exitCode = 1;
     return;
   }
-  if (value === 'on' && !(await probeTcp('127.0.0.1', state.proxyPort, 800))) {
-    console.error('The emunet service is not running; start it first (emunet fix), otherwise the Mac would have no DNS.');
-    process.exitCode = 1;
-    return;
+  if (value === 'on') {
+    await refreshManagedNetwork(true);
+    if (managedNetwork.detected) {
+      console.error(policyMessage());
+      process.exitCode = 2;
+      return;
+    }
+    if (!(await emunetDnsAnswering())) {
+      console.error(`emunet is not answering DNS on 127.0.0.1:${state.dnsPort} (service stopped, or another program holds the port). `
+        + 'Not changing the Mac\'s DNS, otherwise it would have none. Run: emunet doctor');
+      process.exitCode = 1;
+      return;
+    }
   }
+  const restoring = macDnsSummary();
   const ok = await setMacDns(value === 'on');
-  console.log(ok ? `Mac DNS → ${value === 'on' ? '127.0.0.1 (emunet)' : 'automatic (DHCP / VPN)'}` : 'Could not change the DNS setting.');
-  if (!ok) process.exitCode = 1;
+  if (ok && value === 'on') {
+    console.log('Mac DNS → 127.0.0.1 (emunet). A watchdog restores the previous setting if emunet ever stops answering.');
+  } else if (ok) {
+    console.log(`Mac DNS → ${restoring} (restored)`);
+  } else {
+    console.error(macDnsError || 'Could not change the DNS setting.');
+    process.exitCode = 1;
+  }
 }
 
 const HELP = `emunet ${VERSION} — keep Android emulator and macOS internet working across VPN and proxy changes
@@ -1284,44 +1914,58 @@ const HELP = `emunet ${VERSION} — keep Android emulator and macOS internet wor
   emunet off | on                    stop / resume managing emulator proxy settings
   emunet daemon                      run the service in the foreground (brew services uses this)`;
 
-const [command = 'help', ...rest] = process.argv.slice(2);
-switch (command) {
-  case 'daemon':
-    runDaemon();
-    break;
-  case 'status':
-    await cmdStatus();
-    break;
-  case 'doctor':
-    await cmdDoctor({ fix: false });
-    break;
-  case 'fix':
-    await cmdDoctor({ fix: true, yes: rest.includes('--yes') || rest.includes('-y') });
-    break;
-  case 'mac-dns':
-    await cmdMacDns(rest[0]);
-    break;
-  case 'upstream':
-    await cmdUpstream(rest[0]);
-    break;
-  case 'service':
-    await cmdService(rest[0]);
-    break;
-  case 'on':
-    saveState({ manageEmulators: true });
-    console.log('Emulator management is on.');
-    break;
-  case 'off':
-    await cmdOff();
-    break;
-  case 'emulator':
-    await cmdEmulator(rest.find((arg) => !arg.startsWith('-')), rest.includes('--restart'));
-    break;
-  case 'version':
-  case '--version':
-  case '-v':
-    console.log(VERSION);
-    break;
-  default:
-    console.log(HELP);
+async function main(argv) {
+  const [command = 'help', ...rest] = argv;
+  switch (command) {
+    case 'daemon':
+      runDaemon();
+      break;
+    case 'status':
+      await cmdStatus();
+      break;
+    case 'doctor':
+      await cmdDoctor({ fix: false });
+      break;
+    case 'fix':
+      await cmdDoctor({ fix: true, yes: rest.includes('--yes') || rest.includes('-y') });
+      break;
+    case 'mac-dns':
+      await cmdMacDns(rest[0]);
+      break;
+    case 'upstream':
+      await cmdUpstream(rest[0]);
+      break;
+    case 'service':
+      await cmdService(rest[0]);
+      break;
+    case 'on':
+      saveState({ manageEmulators: true });
+      console.log('Emulator management is on.');
+      break;
+    case 'off':
+      await cmdOff();
+      break;
+    case 'emulator':
+      await cmdEmulator(rest.find((arg) => !arg.startsWith('-')), rest.includes('--restart'));
+      break;
+    case 'version':
+    case '--version':
+    case '-v':
+      console.log(VERSION);
+      break;
+    default:
+      console.log(HELP);
+  }
+}
+
+// Run as a CLI; stay quiet when imported (tests).
+const invoked = process.argv[1] ? fs.realpathSync(process.argv[1]) : '';
+if (invoked === fileURLToPath(import.meta.url)) await main(process.argv.slice(2));
+
+export { main, refreshDnsUpstreams, resolveViaSystem, answerQuery, emunetDnsAnswering, setMacDns, refreshManagedNetwork };
+export function setDnsModelForTest(model) {
+  dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], ...model, updatedAt: Date.now() };
+}
+export function setManagedForTest(agents) {
+  managedNetwork = { detected: agents.length > 0, agents, at: Date.now() };
 }

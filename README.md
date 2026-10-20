@@ -1,6 +1,6 @@
 # emunet
 
-**Keep Android emulator and macOS internet working while VPNs and debugging proxies come and go.**
+**Keep Android emulator, iOS Simulator and macOS internet working while VPNs and debugging proxies come and go.**
 
 You connect to the company VPN and the emulator goes offline. You quit Proxyman and every app in the
 emulator says "No internet". You disconnect the VPN and the Mac's browser can't load anything until
@@ -75,7 +75,12 @@ Android SDK platform-tools (`adb`) are needed for the emulator features.
 | emunet service | Start it; if it won't start and the Mac's DNS points at it, switch the Mac's DNS back to automatic |
 | Mac DNS (getaddrinfo, what apps use) | Explain the cause (VPN DNS bound to the wrong interface, VPN DNS left behind after disconnect, unreachable servers) and point the Mac's DNS at emunet |
 | System proxy | Turn off a dead proxy, or one that accepts connections but passes no traffic |
-| Each emulator | Fix its proxy setting, offer to restart it with emunet DNS if its DNS is pinned, re-run Android's network validation |
+| emunet's DNS forwarder | Report another program holding port 53; if the Mac's DNS points at emunet but it cannot answer, restore the previous DNS |
+| mac-dns watchdog | Reinstall it if `mac-dns` is on but the watchdog is missing |
+| Proxy auto-config (PAC / WPAD) | Tell you, since emunet does not evaluate PAC files |
+| Each Android emulator | Fix its proxy setting, offer to restart it with emunet DNS if its DNS is pinned, re-run Android's network validation |
+| iOS Simulator | Nothing extra to fix (it shares the Mac's network); warns when a debugging proxy will break certificate-pinned apps |
+| Company security software | Never changes Mac settings; if `mac-dns` was on, switches it back (see below) |
 
 Changes to macOS network settings are made with `networksetup`; if that needs admin rights you are
 asked for your password via `sudo`.
@@ -90,12 +95,40 @@ asked for your password via `sudo`.
    Fiddler Everywhere, HTTP Toolkit, Requestly, Whistle. A non-default port is only used if it answers
    like an HTTP proxy, so a random dev server is never picked by mistake. Use `emunet upstream host:port`
    for anything else, or `emunet upstream none` to always go direct.
-3. **A DNS forwarder on :53.** It relays raw queries to the VPN's DNS through the tunnel when a VPN
-   is connected, then to the network's DHCP DNS, then to 1.1.1.1 / 8.8.8.8. It never asks the macOS
-   resolver, so it keeps working when that is broken. Emulators started by emunet use it
-   (`-dns-server 127.0.0.1`), and so does the Mac after `emunet mac-dns on`.
+3. **A DNS forwarder on :53.** It never asks the macOS resolver, so it keeps working when that is
+   broken. Emulators started by emunet use it (`-dns-server 127.0.0.1`), and so does the Mac after
+   `emunet mac-dns on`. For each query it follows the same plan macOS would:
+   - names under a per-domain resolver (VPN match domains, `/etc/resolver/*`, Tailscale…) go only to
+     that resolver — public names are never sent there;
+   - everything else goes to the default resolvers (the VPN's DNS first when the VPN set one), then
+     the network's own DHCP DNS, then 1.1.1.1 / 8.8.8.8 as a last resort;
+   - a server that times out, refuses or SERVFAILs is skipped; an NXDOMAIN from a split-horizon VPN DNS
+     for a public name is double-checked with the network DNS, but an NXDOMAIN for the VPN's own
+     domains is final, and nonexistent names are never sent to public resolvers.
 4. **A supervisor.** Every 5 seconds it re-applies the emulator proxy setting and, when Android
    marks the network as unvalidated after a VPN/proxy change, restarts the emulator's Wi-Fi.
+
+### iOS Simulator
+
+The Simulator has no network stack of its own; it uses the Mac's DNS and system proxy. Everything
+`emunet fix` repairs on the Mac (DNS, dead system proxy) fixes the Simulator too. One thing emunet
+cannot fix: apps that pin TLS certificates fail through a debugging proxy (`doctor` tells you when
+that applies) — disable SSL proxying for their domains in your proxy tool.
+
+### Company-managed Macs
+
+If emunet finds network security software (Zscaler, Cisco Umbrella / Secure Client, Netskope,
+Cloudflare WARP / Zero Trust, Palo Alto GlobalProtect, Forcepoint, Jamf Trust, Check Point Harmony),
+it will not change the Mac's DNS or proxy settings:
+
+```console
+$ emunet mac-dns on
+Your organization manages this Mac's network security with Zscaler. emunet will not change the
+Mac's DNS or proxy settings. Ask your IT team if you need a change.
+```
+
+Emulator features keep working, and emulator DNS is answered through the system resolver so the
+company's DNS policy still applies.
 
 ### Why `mac-dns`?
 
@@ -107,9 +140,18 @@ nothing else does. In the office the VPN DNS may also be reachable over the LAN,
 see it at home or on a hotspot.
 
 With `emunet mac-dns on` the Mac asks `127.0.0.1`, and emunet sends the query to the right
-server according to the routing table. **If emunet is stopped while this is on, the Mac has no
-DNS.** The service is kept alive by launchd, `emunet fix` detects it, and you should run
-`emunet mac-dns off` before uninstalling.
+server according to the routing table. Safety nets:
+
+- `mac-dns on` is refused unless emunet is actually answering DNS on 127.0.0.1:53, and on accounts
+  that cannot change DNS without an administrator password (the watchdog could not undo it).
+- The previous DNS setting (IPv4 and IPv6) is remembered per network service; `mac-dns off` and
+  `emunet service uninstall` restore exactly the services emunet changed, and leave a service alone
+  if you changed it yourself in the meantime.
+- A small watchdog (`local.emunet.dnsguard`, plain `/bin/sh`, no Node) checks every 20 s by asking
+  emunet a name only emunet answers, so slow or broken upstream DNS never triggers it. If emunet does
+  not answer twice in a row — crashed, deleted, another program took the port — it puts the previous
+  DNS back and logs it to `~/Library/Logs/emunet.log`. It removes itself once emunet is uninstalled.
+- If emunet cannot bind its ports it exits, so launchd retries instead of keeping a service that does nothing.
 
 ## Use with Android Studio / scripts
 
@@ -127,9 +169,23 @@ Your own scripts can do the same with `emulator -avd <name> -no-snapshot-load -d
 `~/.config/emunet/state.json`: `proxyPort` (8877), `dnsPort` (53), `upstream` (`auto`),
 `manageEmulators` (`true`). Logs: `~/Library/Logs/emunet.log` (Homebrew: `$(brew --prefix)/var/log/emunet.log`).
 
+## When not to use emunet
+
+- **Your Mac is managed by IT** and DNS / web security is enforced: emunet detects the common agents and
+  stays out of the way, but if yours is not on the list, do not run `emunet mac-dns on`.
+- **Your network needs a PAC file or an authenticating proxy** for emulator traffic: set it with
+  `emunet upstream host:port` (emunet does not evaluate PAC or send proxy credentials).
+- **Something else already serves DNS on port 53** (dnsmasq, a local Pi-hole, some Docker setups): the
+  emulator DNS and `mac-dns` features are unavailable; `emunet doctor` shows which program holds the port.
+- **You need Windows or Linux**: not supported (yet).
+
 ## Limitations
 
-- macOS only. Android **emulators** only; physical devices and Genymotion are left alone.
+- macOS only. Android **emulators** and the iOS Simulator; physical devices and Genymotion are left alone.
+- Emulators launched from Android Studio do not get `-dns-server 127.0.0.1`. Their app traffic still goes
+  through emunet's proxy (which resolves names on the Mac), but for full DNS protection start them with
+  `emunet emulator <avd>`.
+- Captive portals (hotel / café Wi-Fi sign-in pages) and IPv6-only networks are not handled.
 - The DNS forwarder listens on `0.0.0.0:53` (macOS only lets non-root processes bind port 53 that
   way) and ignores every client that is not on the loopback interface.
 - Lookups made by emunet's own proxy use IPv4 (A records).
@@ -148,6 +204,7 @@ or `npm uninstall -g emunet`.
 ## Development
 
 ```bash
+npm test                          # 38 tests; isolated config, dry-run, fake DNS servers — no system changes
 scripts/install-local.sh          # run this checkout as a LaunchAgent
 scripts/install-local.sh --brew   # or through a local Homebrew tap
 scripts/release.sh <owner> <tap>  # render the formula for a tagged GitHub release

@@ -1,7 +1,7 @@
 {
   "name": "emunet",
   "version": "0.5.0",
-  "description": "Keep Android emulator and macOS internet working across VPN and debugging-proxy changes",
+  "description": "Keep Android emulator, iOS Simulator and macOS internet working across VPN and debugging-proxy changes",
   "type": "module",
   "bin": {
     "emunet": "emunet.mjs"
@@ -37,5 +37,8 @@
   "homepage": "https://github.com/yunusemreyildiz/emunet#readme",
   "bugs": "https://github.com/yunusemreyildiz/emunet/issues",
   "author": "Yunus Emre Yıldız",
-  "license": "MIT"
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
 }

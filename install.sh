@@ -77,7 +77,9 @@ mkdir -p "$APP_DIR"
 mv "$TMP/emunet.mjs" "$APP_DIR/emunet.mjs"
 cat > "$APP_DIR/emunet" <<EOF
 #!/bin/bash
-exec "$NODE" "$APP_DIR/emunet.mjs" "\$@"
+# Prefer whatever node is on PATH now (nvm / upgrades), fall back to the one found at install time.
+NODE_BIN="\$(command -v node 2>/dev/null || echo "$NODE")"
+exec "\$NODE_BIN" "$APP_DIR/emunet.mjs" "\$@"
 EOF
 chmod +x "$APP_DIR/emunet"
 

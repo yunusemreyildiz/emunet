@@ -1,5 +1,5 @@
 class Emunet < Formula
-  desc "Keep Android emulator and macOS internet working across VPN and proxy changes"
+  desc "Keep Android emulator, iOS Simulator and Mac internet working across VPN changes"
   homepage "@HOMEPAGE@"
   url "@URL@"
   version "@VERSION@"

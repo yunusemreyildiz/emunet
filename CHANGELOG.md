@@ -3,8 +3,23 @@
 ## 0.5.0
 - New install options besides Homebrew: a one-line `curl … | bash` installer and `npm install -g emunet`.
 - `emunet service install|uninstall|status` sets up / removes the login service (LaunchAgent, or
-  `brew services` for Homebrew installs). Uninstalling turns `mac-dns` off first so the Mac keeps DNS.
+  `brew services` for Homebrew installs). Uninstalling restores the Mac's DNS first.
+- DNS forwarder follows macOS's plan: per-domain resolvers only get their domains (no more sending
+  every query to the VPN or Tailscale DNS); servers that time out, REFUSE or SERVFAIL are skipped;
+  split-horizon VPN NXDOMAINs for public names are re-checked with the network DNS; the VPN's own
+  domains and nonexistent names never leak to public resolvers or get hijacked by routers.
+- Company-managed Macs: detects Zscaler, Cisco Umbrella / Secure Client, Netskope, Cloudflare WARP,
+  GlobalProtect, Forcepoint, Jamf Trust and Check Point Harmony; then never changes Mac DNS / proxy
+  settings and answers emulator DNS through the system resolver.
+- `mac-dns` safety: refused unless emunet answers DNS and the account can change DNS without sudo;
+  remembers the previous DNS (IPv4 + IPv6) per service and restores exactly that; a Node-independent
+  watchdog (health name, not real DNS) restores it if emunet stops answering; settings enabled by
+  older versions are adopted and the watchdog is kept up to date automatically.
+- Robustness: exits on port conflicts so launchd retries; TCP DNS upstream hang-ups fall through;
+  short/garbage packets, early client disconnects and malformed proxy URLs are handled.
+- `doctor` / `fix`: PAC / WPAD notice, port-53 owner, watchdog check, iOS Simulator section.
 - The service runs Node from a stable path, so Node upgrades do not break it.
+- Test suite (`npm test`).
 
 ## 0.4.0
 - English CLI, logs and docs.
