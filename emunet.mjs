@@ -23,7 +23,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const execFileAsync = promisify(execFile);
-const VERSION = '0.5.0';
+const VERSION = '0.5.1';
 
 // getaddrinfo runs on libuv's thread pool; a hung VPN resolver must not starve the proxy.
 process.env.UV_THREADPOOL_SIZE ||= '16';
@@ -485,6 +485,14 @@ function forwardHttp(req, res, upstream) {
 
 async function handleRequest(req, res) {
   if (!/^https?:\/\//i.test(req.url)) {
+    // Only answer the local status page by its local name: a web page using DNS rebinding
+    // (attacker.com → 127.0.0.1) must not be able to read VPN DNS servers or domains.
+    const host = (req.headers.host || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
+    if (!['127.0.0.1', 'localhost', '::1'].includes(host)) {
+      res.writeHead(403);
+      res.end();
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(`${JSON.stringify(await statusSnapshot(), null, 2)}\n`);
     return;
@@ -687,8 +695,10 @@ export async function resolveRaw(query, transport = 'udp', { timeoutMs } = {}) {
   const name = queryName(query);
   let fallbackNx = null;
   let nxFromDefault = false;
+  // Names that belong to the VPN or to a per-domain resolver never go to public resolvers.
+  const internal = Boolean(matchSupplemental(name)) || inDomains(name, dnsModel.vpnDomains);
   for (const { server, tier } of serversFor(name)) {
-    if (nxFromDefault && tier === 'public') break;
+    if (tier === 'public' && (nxFromDefault || internal)) break;
     let response;
     try {
       const timeout = timeoutMs || (dnsModel.vpn.includes(server) ? 2500 : 2000);

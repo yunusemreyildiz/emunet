@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+- Privacy: names under the VPN's domains or a per-domain resolver are never sent to public resolvers,
+  even when every other DNS server is down.
+- Security: the local status page only answers requests addressed to 127.0.0.1 / localhost, so a web
+  page using DNS rebinding cannot read your VPN DNS servers or domains.
+
 ## 0.5.0
 - New install options besides Homebrew: a one-line `curl … | bash` installer and `npm install -g emunet`.
 - `emunet service install|uninstall|status` sets up / removes the login service (LaunchAgent, or

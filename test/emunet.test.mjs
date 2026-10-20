@@ -575,3 +575,36 @@ test('mac-dns off leaves an untracked 127.0.0.1 alone when another DNS program a
   assert.ok(!lines.some((l) => l.includes('-setdnsservers')), lines.join('\n'));
   fakeService('Wi-Fi', ['192.168.1.1']);
 });
+
+// ---------------------------------------------------------------------------
+// 9. Privacy / security
+// ---------------------------------------------------------------------------
+
+test('internal names never reach public resolvers, even when VPN and network DNS are down', async () => {
+  model({ defaults: [`127.0.0.1:${PORTS.dead}`], dhcp: [`127.0.0.1:${PORTS.dead}`], vpn: [`127.0.0.1:${PORTS.dead}`], vpnDomains: ['corp.example'] });
+  resetHits();
+  await assert.rejects(() => emunet.resolveRaw(emunet.buildQuery('jira.corp.example'), 'udp', { timeoutMs: 300 }));
+  assert.equal(hits.pub.length, 0);
+  model({ defaults: [`127.0.0.1:${PORTS.dead}`], dhcp: [], supplemental: [{ domain: 'tail.example', servers: [`127.0.0.1:${PORTS.dead}`] }] });
+  await assert.rejects(() => emunet.resolveRaw(emunet.buildQuery('box.tail.example'), 'udp', { timeoutMs: 300 }));
+  assert.equal(hits.pub.length, 0);
+});
+
+test('status page refuses requests with a foreign Host header (DNS rebinding)', async () => {
+  const daemon = spawn(process.execPath, [CLI, 'daemon'], { env: { ...process.env }, stdio: 'ignore' });
+  try {
+    let code = '';
+    for (let i = 0; i < 40 && !code; i += 1) {
+      code = (await run('/usr/bin/curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', `http://127.0.0.1:${PORTS.emunetProxy}/`])).stdout;
+      if (code === '000') code = '';
+      if (!code) await new Promise((r) => setTimeout(r, 150));
+    }
+    assert.equal(code, '200');
+    const evil = await run('/usr/bin/curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '-H', 'Host: attacker.example', `http://127.0.0.1:${PORTS.emunetProxy}/`]);
+    assert.equal(evil.stdout, '403');
+    const local = await run('/usr/bin/curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', `http://localhost:${PORTS.emunetProxy}/`]);
+    assert.equal(local.stdout, '200');
+  } finally {
+    daemon.kill();
+  }
+});
