@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#0EA5A4"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="#0B1220"/>
+  <g transform="translate(120 160) scale(0.625)">
+    <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+    <rect x="150" y="92" width="212" height="328" rx="40" fill="none" stroke="#FFFFFF" stroke-width="22"/>
+    <rect x="226" y="112" width="60" height="12" rx="6" fill="#FFFFFF"/>
+    <g fill="none" stroke="#FFFFFF" stroke-width="20" stroke-linecap="round">
+      <path d="M196 262 a 84 84 0 0 1 120 0"/>
+      <path d="M220 290 a 50 50 0 0 1 72 0"/>
+    </g>
+    <circle cx="256" cy="322" r="15" fill="#FFFFFF"/>
+    <circle cx="372" cy="384" r="64" fill="#22C55E" stroke="#FFFFFF" stroke-width="14"/>
+    <path d="M342 386 l20 20 l40 -42" fill="none" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <g font-family="-apple-system, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" fill="#FFFFFF">
+    <text x="500" y="300" font-size="120" font-weight="800">emunet</text>
+    <text x="504" y="370" font-size="34" fill="#CBD5E1">Android emulator, iOS Simulator and Mac</text>
+    <text x="504" y="416" font-size="34" fill="#CBD5E1">internet that survives VPN &amp; proxy changes.</text>
+    <text x="504" y="490" font-size="30" fill="#5EEAD4" font-family="'SF Mono', Menlo, Consolas, monospace">$ emunet fix</text>
+  </g>
+</svg>

@@ -1,4 +1,8 @@
-# emunet
+<p align="center">
+  <img src="https://raw.githubusercontent.com/yunusemreyildiz/emunet/main/assets/logo.svg" width="128" alt="emunet logo">
+</p>
+
+<h1 align="center">emunet</h1>
 
 **Keep Android emulator, iOS Simulator and macOS internet working while VPNs and debugging proxies come and go.**
 

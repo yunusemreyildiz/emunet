@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="emunet logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#0EA5A4"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <!-- phone / emulator -->
+  <rect x="150" y="92" width="212" height="328" rx="40" fill="none" stroke="#FFFFFF" stroke-width="22"/>
+  <rect x="226" y="112" width="60" height="12" rx="6" fill="#FFFFFF"/>
+  <!-- signal -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="20" stroke-linecap="round">
+    <path d="M196 262 a 84 84 0 0 1 120 0"/>
+    <path d="M220 290 a 50 50 0 0 1 72 0"/>
+  </g>
+  <circle cx="256" cy="322" r="15" fill="#FFFFFF"/>
+  <!-- fixed badge -->
+  <circle cx="372" cy="384" r="64" fill="#22C55E" stroke="#FFFFFF" stroke-width="14"/>
+  <path d="M342 386 l20 20 l40 -42" fill="none" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
