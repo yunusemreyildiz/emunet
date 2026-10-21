@@ -23,7 +23,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const execFileAsync = promisify(execFile);
-const VERSION = '0.6.1';
+const VERSION = '0.6.2';
 
 // getaddrinfo runs on libuv's thread pool; a hung VPN resolver must not starve the proxy.
 process.env.UV_THREADPOOL_SIZE ||= '16';
@@ -585,7 +585,7 @@ function isOwnServer(server) {
 
 async function refreshDnsUpstreams() {
   if (process.env.EMUNET_DNS_MODEL) {
-    dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], vpnDomains: [], vpnUp: false, vpnSource: 'none', public: null, ...JSON.parse(process.env.EMUNET_DNS_MODEL), updatedAt: Date.now() };
+    dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], vpnDomains: [], vpnUp: false, vpnSource: 'none', vpnViaSupplemental: false, vpnKeptManualDns: false, public: null, ...JSON.parse(process.env.EMUNET_DNS_MODEL), updatedAt: Date.now() };
     return;
   }
   const resolvers = parseScutilDns(await sh('/usr/sbin/scutil', ['--dns']).catch(() => ''));
@@ -645,7 +645,36 @@ async function refreshDnsUpstreams() {
     }
   }
   const defaults = [...vpn, ...all.filter((s) => !vpn.includes(s))];
-  dnsModel = { supplemental, defaults, dhcp, vpn, vpnDomains, vpnUp, vpnSource, updatedAt: Date.now() };
+  // VPNs that publish DNS per domain (Tailscale, WireGuard, many corporate clients) are fine even
+  // with no default VPN DNS.
+  let vpnViaSupplemental = false;
+  for (const r of supplemental) {
+    for (const server of r.servers) if (isTunnelInterface(await routeInterface(splitServer(server).host))) vpnViaSupplemental = true;
+  }
+  // Tunnelblick records what it expected the DNS to be; 127.0.0.1 there means it kept emunet's
+  // manual DNS instead of installing the VPN's.
+  const openvpnState = await scutilShow('State:/Network/OpenVPN');
+  const vpnKeptManualDns = vpnUp && /ExpectedDnsAddresses : [^\n]*127\.0\.0\.1/.test(openvpnState);
+  dnsModel = { supplemental, defaults, dhcp, vpn, vpnDomains, vpnUp, vpnSource, vpnViaSupplemental, vpnKeptManualDns, updatedAt: Date.now() };
+}
+
+// 'ok' | 'unknown' (VPN names will fail — definite) | 'hidden?' (VPN up, publishes no DNS; only a
+// problem if it has internal names) | 'none' (no VPN)
+export function vpnDnsState(model) {
+  if (!model.vpnUp) return 'none';
+  if (model.vpn.length || model.vpnViaSupplemental) return 'ok';
+  if (model.vpnDomains.length || model.vpnKeptManualDns) return 'unknown';
+  return 'hidden?';
+}
+
+// Does a VPN DNS server answer at all? (stale remembered servers)
+async function dnsServerAnswers(server, name) {
+  try {
+    await forwardUdp(buildQuery(name || 'example.com'), server, 2500);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function inDomains(name, domains) {
@@ -1735,21 +1764,36 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
     say(null, 'Mac DNS works now but is unprotected: VPN + proxy changes can break it. Permanent fix: emunet mac-dns on');
   }
 
-  // 3b. VPN connected but its DNS unknown (e.g. Tunnelblick with a manually set Mac DNS)
-  if (dnsModel.vpnUp && dnsModel.vpnDomains.length) {
-    if (!dnsModel.vpn.length) {
+  // 3b. VPN DNS: unknown (e.g. Tunnelblick kept the manual DNS), stale, or fine
+  const vpnState = vpnDnsState(dnsModel);
+  const vpnDomainText = dnsModel.vpnDomains.length ? dnsModel.vpnDomains.join(', ') : 'your company';
+  if (vpnState === 'unknown') {
+    problems += 1;
+    say(false, `VPN is connected but its DNS servers are unknown — ${vpnDomainText} names will fail (emunet does not send them to your router).`);
+    console.log(dnsModel.vpnKeptManualDns
+      ? '  Cause: Tunnelblick kept the Mac\'s manually set DNS (mac-dns on) instead of installing the VPN\'s DNS.'
+      : '  Likely cause: the VPN client left the Mac\'s manually set DNS alone and only added its search domain.');
+    console.log('  If you know the VPN DNS: emunet vpn-dns add <domain> <server> [server…]');
+    if (fix && macDnsOnEmunet) {
+      doing('switching mac-dns off; then disconnect and reconnect your VPN so it can set its DNS (emunet will remember it)');
+      if (await setMacDns(false)) fixed += 1;
+    } else if (fix) {
+      console.log('  → disconnect and reconnect your VPN; emunet will remember its DNS from then on.');
+    }
+  } else if (vpnState === 'hidden?' && macDnsOnEmunet) {
+    say(null, 'A VPN is connected but publishes no DNS servers. If company names stop resolving, add them: emunet vpn-dns add <domain> <server>');
+  } else if (vpnState === 'ok' && dnsModel.vpn.length) {
+    const probe = dnsModel.vpnDomains[0];
+    const answering = [];
+    for (const server of dnsModel.vpn) if (await dnsServerAnswers(server, probe)) answering.push(server);
+    if (!answering.length) {
       problems += 1;
-      say(false, `VPN is connected but its DNS servers are unknown — names under ${dnsModel.vpnDomains.join(', ')} will fail (emunet does not send them to your router).`);
-      console.log('  Likely cause: the VPN client left the Mac\'s manually set DNS alone (Tunnelblick does this with `mac-dns on`)');
-      console.log('  and only added its search domain. If you know the VPN DNS: emunet vpn-dns add <domain> <server> [server…]');
-      if (fix && macDnsOnEmunet) {
-        doing('switching mac-dns off; then disconnect and reconnect your VPN so it can set its DNS (emunet will remember it)');
-        if (await setMacDns(false)) fixed += 1;
-      } else if (fix) {
-        console.log('  → disconnect and reconnect your VPN; emunet will remember its DNS from then on.');
+      say(false, `VPN DNS ${dnsModel.vpn.join(', ')} does not answer${dnsModel.vpnSource === 'memory' ? ' — the remembered servers may be outdated' : ''}.`);
+      if (dnsModel.vpnSource === 'memory') {
+        console.log(`  Forget them and reconnect the VPN with mac-dns off: emunet vpn-dns remove ${dnsModel.vpnDomains[0] || '<domain>'}`);
       }
     } else {
-      say(true, `VPN DNS: ${dnsModel.vpn.join(', ')} for ${dnsModel.vpnDomains.join(', ')}${dnsModel.vpnSource === 'memory' ? ' (remembered — the VPN client did not publish it)' : ''}`);
+      say(true, `VPN DNS: ${dnsModel.vpn.join(', ')}${dnsModel.vpnDomains.length ? ` for ${dnsModel.vpnDomains.join(', ')}` : ''}${dnsModel.vpnSource === 'memory' ? ' (remembered — the VPN client did not publish it)' : ''}`);
     }
   }
 
@@ -2012,8 +2056,8 @@ async function cmdMacDns(value) {
       return;
     }
     await refreshDnsUpstreams().catch(() => {});
-    if (dnsModel.vpnUp && dnsModel.vpnDomains.length && !dnsModel.vpn.length) {
-      console.error(`A VPN is connected but emunet does not know its DNS servers (for ${dnsModel.vpnDomains.join(', ')}). `
+    if (vpnDnsState(dnsModel) === 'unknown') {
+      console.error(`A VPN is connected but emunet does not know its DNS servers (for ${dnsModel.vpnDomains.join(', ') || 'its internal names'}). `
         + 'Reconnect the VPN with mac-dns off first so emunet can learn them, or add them: emunet vpn-dns add <domain> <server> [server…]');
       process.exitCode = 1;
       return;
@@ -2026,6 +2070,9 @@ async function cmdMacDns(value) {
     }
   }
   const restoring = macDnsSummary();
+  if (value === 'on' && vpnDnsState(dnsModel) === 'hidden?') {
+    console.log('Note: a VPN is connected and publishes no DNS servers. If its internal names stop resolving, add them: emunet vpn-dns add <domain> <server>');
+  }
   const ok = await setMacDns(value === 'on');
   if (ok && value === 'on') {
     console.log('Mac DNS → 127.0.0.1 (emunet). A watchdog restores the previous setting if emunet ever stops answering.');

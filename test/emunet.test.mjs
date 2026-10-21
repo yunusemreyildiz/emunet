@@ -680,3 +680,27 @@ test('emunet vpn-dns add / list / remove', async () => {
   await run(process.execPath, [CLI, 'vpn-dns', 'remove', 'corp.example']);
   assert.match((await run(process.execPath, [CLI, 'vpn-dns', 'list'])).stdout, /No VPN DNS remembered/);
 });
+
+// ---------------------------------------------------------------------------
+// 12. vpnDnsState: definite problems vs. VPNs that simply publish no DNS (Tailscale etc.)
+// ---------------------------------------------------------------------------
+
+test('vpnDnsState separates "VPN names will fail" from harmless VPNs without DNS', () => {
+  const base = { vpnUp: true, vpn: [], vpnDomains: [], vpnViaSupplemental: false, vpnKeptManualDns: false };
+  assert.equal(emunet.vpnDnsState({ ...base, vpnUp: false }), 'none');
+  assert.equal(emunet.vpnDnsState({ ...base, vpn: ['10.0.0.1'] }), 'ok');
+  assert.equal(emunet.vpnDnsState({ ...base, vpnViaSupplemental: true }), 'ok', 'Tailscale / WireGuard match-domain DNS');
+  assert.equal(emunet.vpnDnsState({ ...base, vpnDomains: ['corp.example'] }), 'unknown');
+  assert.equal(emunet.vpnDnsState({ ...base, vpnKeptManualDns: true }), 'unknown', 'Tunnelblick kept mac-dns, no search domain');
+  assert.equal(emunet.vpnDnsState(base), 'hidden?', 'routing-only VPN: warn, do not block');
+});
+
+test('mac-dns on is refused when Tunnelblick kept the manual DNS even without a search domain', async () => {
+  fs.writeFileSync(path.join(TMP, 'state.json'), JSON.stringify({ proxyPort: PORTS.emunetProxy, dnsPort: PORTS.health, upstream: 'none', manageEmulators: false }));
+  const r = await run(process.execPath, [CLI, 'mac-dns', 'on'], { env: { ...process.env, EMUNET_DNS_MODEL: JSON.stringify({ vpnUp: true, vpnKeptManualDns: true }) } });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /does not know its DNS servers \(for its internal names\)/);
+  const ok = await run(process.execPath, [CLI, 'mac-dns', 'on'], { env: { ...process.env, EMUNET_DNS_MODEL: JSON.stringify({ vpnUp: true }) } });
+  assert.match(ok.stdout, /publishes no DNS servers/, 'routing-only VPN only gets a note');
+  fs.writeFileSync(path.join(TMP, 'state.json'), JSON.stringify({ proxyPort: PORTS.emunetProxy, dnsPort: PORTS.emunetDns, upstream: 'none', manageEmulators: false }));
+});

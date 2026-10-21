@@ -120,8 +120,9 @@ leave it alone: they add their search domain but publish their DNS servers nowhe
   their own address, which sends company traffic (git, HTTPS) to the router.
 - emunet remembers the VPN DNS whenever it can see it and reuses it later, but only while those servers
   are actually routed through the tunnel.
-- `emunet doctor` reports "VPN is connected but its DNS servers are unknown"; `mac-dns on` is refused in
-  that state. To teach emunet: reconnect the VPN once with `mac-dns off`, or add it yourself:
+- `emunet doctor` reports "VPN is connected but its DNS servers are unknown" (also when Tunnelblick kept
+  the manual DNS without adding a search domain) and checks that remembered servers still answer;
+  `mac-dns on` is refused in that state. VPNs that publish DNS per domain (Tailscale, WireGuard) are fine. To teach emunet: reconnect the VPN once with `mac-dns off`, or add it yourself:
 
 ```bash
 emunet vpn-dns add corp.example 10.20.0.53 10.20.0.54
@@ -148,6 +149,11 @@ Mac's DNS or proxy settings. Ask your IT team if you need a change.
 
 Emulator features keep working, and emulator DNS is answered through the system resolver so the
 company's DNS policy still applies.
+
+### Do I need `mac-dns`?
+
+Only if connecting your VPN breaks the **Mac's own** internet (ping works, no site loads). Emulator
+features never need it. It is off by default; leave it off when the VPN does not cause trouble.
 
 ### Why `mac-dns`?
 
@@ -237,7 +243,7 @@ or `npm uninstall -g emunet`.
 ## Development
 
 ```bash
-npm test                          # 49 tests; isolated config, dry-run, fake DNS servers — no system changes
+npm test                          # 51 tests; isolated config, dry-run, fake DNS servers — no system changes
 scripts/install-local.sh          # run this checkout as a LaunchAgent
 scripts/install-local.sh --brew   # or through a local Homebrew tap
 scripts/release.sh <owner> <tap>  # render the formula for a tagged GitHub release

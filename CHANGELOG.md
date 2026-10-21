@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2
+- Detects a VPN whose DNS is hidden even when it adds no search domain (Tunnelblick keeping the manual
+  DNS); `doctor` reports it and `mac-dns on` is refused. VPNs that publish no DNS at all only get a note,
+  and per-domain VPN DNS (Tailscale, WireGuard) counts as known.
+- `doctor` checks that the VPN DNS (including remembered servers) actually answers.
+- README: when you need `mac-dns` (only if the VPN breaks the Mac's own internet).
+
 ## 0.6.1
 - Fix: with `mac-dns on` and a VPN client that does not publish its DNS (Tunnelblick), names under the
   VPN's domains were sent to the local network's DNS; routers that answer unknown names with their own
