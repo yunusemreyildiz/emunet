@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1
+- Fix: with `mac-dns on` and a VPN client that does not publish its DNS (Tunnelblick), names under the
+  VPN's domains were sent to the local network's DNS; routers that answer unknown names with their own
+  address then received company traffic (seen as TLS errors on `git push`). While a VPN is up, VPN
+  names now go only to the VPN's DNS, and fail instead of falling back.
+- emunet remembers VPN DNS per domain (`emunet vpn-dns list|add|remove`) and reuses it only while the
+  servers are routed through the tunnel.
+- `doctor` reports a connected VPN whose DNS is unknown; `mac-dns on` is refused in that state.
+
 ## 0.6.0
 - `emunet emulator-args` and `import { emulatorArgs } from 'emunet'`: the emulator flags
   (`-no-snapshot-load -dns-server 127.0.0.1`) for your own scripts, CI and Node tools — empty when

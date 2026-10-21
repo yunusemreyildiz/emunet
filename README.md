@@ -63,6 +63,7 @@ Android SDK platform-tools (`adb`) are needed for the emulator features.
 | `emunet status` | What emunet is doing right now |
 | `emunet service install\|uninstall\|status` | Run emunet in the background at login (LaunchAgent, or `brew services` for Homebrew installs) |
 | `emunet mac-dns on\|off` | Point the Mac's own DNS at emunet so broken VPN DNS can't take the whole Mac down (see below) |
+| `emunet vpn-dns [list\|add\|remove]` | VPN DNS emunet remembers, for VPN clients that hide it (see below) |
 | `emunet upstream [auto\|none\|host:port]` | Which debugging proxy to chain emulator traffic through |
 | `emunet emulator <avd> [--restart]` | (Re)start an emulator with emunet DNS |
 | `emunet emulator-args` | The emulator flags for your own scripts (empty when emunet is not running) |
@@ -108,6 +109,23 @@ asked for your password via `sudo`.
      domains is final, and nonexistent names are never sent to public resolvers.
 4. **A supervisor.** Every 5 seconds it re-applies the emulator proxy setting and, when Android
    marks the network as unvalidated after a VPN/proxy change, restarts the emulator's Wi-Fi.
+
+### VPN clients that hide their DNS (Tunnelblick)
+
+With `mac-dns on` the Mac's DNS is set manually, and some VPN clients — Tunnelblick by default — then
+leave it alone: they add their search domain but publish their DNS servers nowhere. emunet handles it:
+
+- While a VPN is up, names under the VPN's domains go **only** to the VPN's DNS. If that DNS is unknown
+  they fail (SERVFAIL) instead of being asked to your router — many routers answer unknown names with
+  their own address, which sends company traffic (git, HTTPS) to the router.
+- emunet remembers the VPN DNS whenever it can see it and reuses it later, but only while those servers
+  are actually routed through the tunnel.
+- `emunet doctor` reports "VPN is connected but its DNS servers are unknown"; `mac-dns on` is refused in
+  that state. To teach emunet: reconnect the VPN once with `mac-dns off`, or add it yourself:
+
+```bash
+emunet vpn-dns add corp.example 10.20.0.53 10.20.0.54
+```
 
 ### iOS Simulator
 
@@ -219,7 +237,7 @@ or `npm uninstall -g emunet`.
 ## Development
 
 ```bash
-npm test                          # 45 tests; isolated config, dry-run, fake DNS servers — no system changes
+npm test                          # 49 tests; isolated config, dry-run, fake DNS servers — no system changes
 scripts/install-local.sh          # run this checkout as a LaunchAgent
 scripts/install-local.sh --brew   # or through a local Homebrew tap
 scripts/release.sh <owner> <tap>  # render the formula for a tagged GitHub release

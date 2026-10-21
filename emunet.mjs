@@ -23,7 +23,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const execFileAsync = promisify(execFile);
-const VERSION = '0.6.0';
+const VERSION = '0.6.1';
 
 // getaddrinfo runs on libuv's thread pool; a hung VPN resolver must not starve the proxy.
 process.env.UV_THREADPOOL_SIZE ||= '16';
@@ -522,7 +522,35 @@ export const PUBLIC_DNS = ['1.1.1.1', '8.8.8.8'];
 //   defaults:     the default resolvers the network services ask for (VPN-provided first).
 //   dhcp:         the DNS the current network handed out (survives a VPN overwriting it).
 //   vpnDomains:   the VPN's own DomainName / SearchDomains — its NXDOMAIN for these is final.
-let dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], vpnDomains: [], public: null, updatedAt: 0 };
+//   vpnUp / vpnSource: a VPN interface is up; where its DNS came from (system | memory | none).
+let dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], vpnDomains: [], vpnUp: false, vpnSource: 'none', public: null, updatedAt: 0 };
+
+// VPN DNS memory. Some VPN clients (Tunnelblick) do not write their DNS servers anywhere when the
+// Mac's DNS is set manually (mac-dns on) — they only add the search domain. emunet remembers the
+// VPN DNS it saw before (or what the user added with `emunet vpn-dns add`) per domain set, and
+// reuses it only while those servers are actually routed through the tunnel.
+// Suffixes home routers hand out; never treated as VPN domains.
+const LOCAL_DOMAINS = new Set(['local', 'lan', 'home', 'home.arpa', 'localdomain', 'localhost']);
+
+const domainKey = (domains) => [...new Set(domains)].sort().join(',');
+
+export function learnVpnDns(memory = [], domains, servers, { manual = false } = {}) {
+  const key = domainKey(domains);
+  if (!key || !servers.length) return memory;
+  const existing = memory.find((e) => domainKey(e.domains) === key);
+  if (existing?.manual && !manual) return memory; // what the user entered wins over what we observed
+  if (existing && existing.servers.join() === servers.join() && Boolean(existing.manual) === manual) return memory;
+  return [
+    ...memory.filter((e) => domainKey(e.domains) !== key),
+    { domains: key.split(','), servers: [...servers], manual, learnedAt: new Date().toISOString() },
+  ];
+}
+
+export function vpnServersFromMemory(memory, vpnDomains, isTunnelRouted) {
+  const hits = (memory || []).filter((e) => e.domains.some((d) => vpnDomains.includes(d)));
+  const servers = [...new Set(hits.flatMap((e) => e.servers))];
+  return servers.filter((server) => isTunnelRouted(server));
+}
 
 function splitServer(server) {
   const [host, port] = server.split(':');
@@ -557,7 +585,7 @@ function isOwnServer(server) {
 
 async function refreshDnsUpstreams() {
   if (process.env.EMUNET_DNS_MODEL) {
-    dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], vpnDomains: [], public: null, ...JSON.parse(process.env.EMUNET_DNS_MODEL), updatedAt: Date.now() };
+    dnsModel = { supplemental: [], defaults: [], dhcp: [], vpn: [], vpnDomains: [], vpnUp: false, vpnSource: 'none', public: null, ...JSON.parse(process.env.EMUNET_DNS_MODEL), updatedAt: Date.now() };
     return;
   }
   const resolvers = parseScutilDns(await sh('/usr/sbin/scutil', ['--dns']).catch(() => ''));
@@ -571,6 +599,7 @@ async function refreshDnsUpstreams() {
   const keys = (await scutilRun('list State:/Network/Service/[^/]+/DNS\n')).match(/State:\/Network\/Service\/\S+\/DNS/g) || [];
   const candidates = [];
   const domainsByServer = new Map();
+  const serviceDomains = new Set();
   for (const key of keys) {
     const dict = await scutilShow(key);
     if (/SupplementalMatchDomains/.test(dict)) continue;
@@ -580,6 +609,7 @@ async function refreshDnsUpstreams() {
       ...[...(/SearchDomains : <array> \{([^}]*)\}/.exec(dict)?.[1] || '').matchAll(/\d+ : (\S+)/g)].map((m) => m[1]),
     ].filter(Boolean).map((d) => d.toLowerCase().replace(/\.$/, ''));
     for (const server of servers) domainsByServer.set(server, [...(domainsByServer.get(server) || []), ...domains]);
+    domains.forEach((d) => serviceDomains.add(d));
     candidates.push(...servers);
   }
   const globalDefault = resolvers.find((r) => !r.domain)?.servers || [];
@@ -588,11 +618,34 @@ async function refreshDnsUpstreams() {
   for (const server of all) {
     if (isTunnelInterface(await routeInterface(splitServer(server).host))) vpn.push(server);
   }
-  const defaults = [...vpn, ...all.filter((s) => !vpn.includes(s))];
   const iface = /PrimaryInterface : (\S+)/.exec(await scutilShow('State:/Network/Global/IPv4'))?.[1] || 'en0';
   const dhcp = ipv4List(await sh('/usr/sbin/ipconfig', ['getoption', iface, 'domain_name_server']).catch(() => ''));
-  const vpnDomains = [...new Set(vpn.flatMap((server) => domainsByServer.get(server) || []))];
-  dnsModel = { supplemental, defaults, dhcp, vpn, vpnDomains, updatedAt: Date.now() };
+  const dhcpDomain = (await sh('/usr/sbin/ipconfig', ['getoption', iface, 'domain_name']).catch(() => '')).trim().toLowerCase();
+  const vpnUp = vpnInterfaces().length > 0;
+  // The VPN's domains: those of the tunnel-routed servers, plus — while a VPN is up — every search
+  // domain the network services carry that did not come from the local network's DHCP.
+  const vpnDomains = [...new Set([
+    ...vpn.flatMap((server) => domainsByServer.get(server) || []),
+    ...(vpnUp ? [...serviceDomains].filter((d) => d && d !== dhcpDomain && !LOCAL_DOMAINS.has(d)) : []),
+  ])];
+  let vpnSource = vpn.length ? 'system' : 'none';
+  if (vpn.length && vpnDomains.length) {
+    const ownDomains = [...new Set(vpn.flatMap((server) => domainsByServer.get(server) || []))];
+    const memory = learnVpnDns(state.vpnDns, ownDomains.length ? ownDomains : vpnDomains, vpn);
+    if (memory !== state.vpnDns) state = saveState({ vpnDns: memory });
+  } else if (vpnUp && vpnDomains.length) {
+    const routed = new Set();
+    for (const entry of state.vpnDns || []) {
+      for (const server of entry.servers) if (isTunnelInterface(await routeInterface(splitServer(server).host))) routed.add(server);
+    }
+    const remembered = vpnServersFromMemory(state.vpnDns, vpnDomains, (server) => routed.has(server));
+    if (remembered.length) {
+      vpn.push(...remembered);
+      vpnSource = 'memory';
+    }
+  }
+  const defaults = [...vpn, ...all.filter((s) => !vpn.includes(s))];
+  dnsModel = { supplemental, defaults, dhcp, vpn, vpnDomains, vpnUp, vpnSource, updatedAt: Date.now() };
 }
 
 function inDomains(name, domains) {
@@ -615,6 +668,13 @@ export function serversFor(name) {
   };
   const match = matchSupplemental(name);
   if (match) add(match.servers, 'match');
+  if (!match && dnsModel.vpnUp && inDomains(name, dnsModel.vpnDomains)) {
+    // A VPN-internal name while the VPN is up: only the VPN's DNS may answer. The local network's
+    // DNS cannot know it, and many routers answer unknown names with their own address — that is
+    // how gitlab.<company> ended up pointing at the home router. Unknown VPN DNS → fail loudly.
+    add(dnsModel.vpn, 'default');
+    return out;
+  }
   add(dnsModel.defaults, 'default');
   add(dnsModel.dhcp, 'dhcp');
   add(dnsModel.public || PUBLIC_DNS, 'public');
@@ -1126,6 +1186,8 @@ async function statusSnapshot() {
     emulatorProcesses: await emulatorProcesses(),
     dnsServers: dnsServerOrder(),
     vpnDns: dnsModel.vpn,
+    vpnSource: dnsModel.vpnSource,
+    vpnDomains: dnsModel.vpnDomains,
     mac: await primaryService(),
     managedNetwork: (await refreshManagedNetwork()).agents,
     dnsGuard: await guardLoaded(),
@@ -1673,6 +1735,24 @@ async function cmdDoctor({ fix = false, yes = false } = {}) {
     say(null, 'Mac DNS works now but is unprotected: VPN + proxy changes can break it. Permanent fix: emunet mac-dns on');
   }
 
+  // 3b. VPN connected but its DNS unknown (e.g. Tunnelblick with a manually set Mac DNS)
+  if (dnsModel.vpnUp && dnsModel.vpnDomains.length) {
+    if (!dnsModel.vpn.length) {
+      problems += 1;
+      say(false, `VPN is connected but its DNS servers are unknown — names under ${dnsModel.vpnDomains.join(', ')} will fail (emunet does not send them to your router).`);
+      console.log('  Likely cause: the VPN client left the Mac\'s manually set DNS alone (Tunnelblick does this with `mac-dns on`)');
+      console.log('  and only added its search domain. If you know the VPN DNS: emunet vpn-dns add <domain> <server> [server…]');
+      if (fix && macDnsOnEmunet) {
+        doing('switching mac-dns off; then disconnect and reconnect your VPN so it can set its DNS (emunet will remember it)');
+        if (await setMacDns(false)) fixed += 1;
+      } else if (fix) {
+        console.log('  → disconnect and reconnect your VPN; emunet will remember its DNS from then on.');
+      }
+    } else {
+      say(true, `VPN DNS: ${dnsModel.vpn.join(', ')} for ${dnsModel.vpnDomains.join(', ')}${dnsModel.vpnSource === 'memory' ? ' (remembered — the VPN client did not publish it)' : ''}`);
+    }
+  }
+
   // 4. System proxy
   const proxyInfo = await proxySettings();
   const proxy = proxyInfo.proxy;
@@ -1814,6 +1894,9 @@ async function cmdStatus() {
   console.log(`Mac DNS (${status.mac?.name || '?'}): ${macOn ? 'emunet (127.0.0.1) — protected' : `${status.mac?.dnsServers.join(', ') || 'automatic'} — unprotected (emunet mac-dns on)`}`);
   if (status.managedNetwork.length) console.log(`Managed network security: ${status.managedNetwork.join(', ')} (emunet leaves Mac settings alone; emulator DNS uses the system resolver)`);
   if (macOn) console.log(`mac-dns watchdog: ${status.dnsGuard ? 'active' : 'MISSING (run emunet fix)'}`);
+  if (status.vpn.length) {
+    console.log(`VPN DNS: ${status.vpnDns.length ? `${status.vpnDns.join(', ')} (${status.vpnSource})` : 'UNKNOWN — VPN names will fail (run emunet doctor)'}${status.vpnDomains.length ? ` for ${status.vpnDomains.join(', ')}` : ''}`);
+  }
   console.log(`DNS server order: ${status.dnsServers.join(' → ')}${status.vpnDns.length ? `  (VPN DNS: ${status.vpnDns.join(', ')})` : ''}`);
   for (const emulator of status.emulators) {
     console.log(`${emulator.serial}: http_proxy=${emulator.httpProxy}  validated=${yesNo(emulator.wifiValidated)}`);
@@ -1889,6 +1972,32 @@ async function cmdUpstream(value) {
   console.log(`upstream = ${value} (the service applies it within 5 s)`);
 }
 
+async function cmdVpnDns([action, domain, ...servers]) {
+  const memory = state.vpnDns || [];
+  if (!action || action === 'list') {
+    if (!memory.length) console.log('No VPN DNS remembered yet.');
+    for (const e of memory) console.log(`${e.domains.join(', ')} → ${e.servers.join(', ')}  (${e.manual ? 'added by you' : 'learned'} ${e.learnedAt?.slice(0, 10) || ''})`);
+    return;
+  }
+  if (action === 'add' && domain && servers.length && servers.every((s) => /^\d{1,3}(\.\d{1,3}){3}$/.test(s))) {
+    state = saveState({ vpnDns: learnVpnDns(memory, [domain.toLowerCase().replace(/\.$/, '')], servers, { manual: true }) });
+    console.log(`VPN DNS for ${domain}: ${servers.join(', ')} (used only while these servers are routed through the VPN)`);
+    return;
+  }
+  if ((action === 'remove' || action === 'forget') && domain) {
+    state = saveState({ vpnDns: memory.filter((e) => !e.domains.includes(domain.toLowerCase())) });
+    console.log(`Forgot VPN DNS for ${domain}.`);
+    return;
+  }
+  if (action === 'forget-all') {
+    state = saveState({ vpnDns: [] });
+    console.log('Forgot all remembered VPN DNS.');
+    return;
+  }
+  console.error('Usage: emunet vpn-dns [list | add <domain> <server> [server…] | remove <domain> | forget-all]');
+  process.exitCode = 1;
+}
+
 async function cmdMacDns(value) {
   if (!['on', 'off'].includes(value)) {
     console.error('Usage: emunet mac-dns on|off');
@@ -1900,6 +2009,13 @@ async function cmdMacDns(value) {
     if (managedNetwork.detected) {
       console.error(policyMessage());
       process.exitCode = 2;
+      return;
+    }
+    await refreshDnsUpstreams().catch(() => {});
+    if (dnsModel.vpnUp && dnsModel.vpnDomains.length && !dnsModel.vpn.length) {
+      console.error(`A VPN is connected but emunet does not know its DNS servers (for ${dnsModel.vpnDomains.join(', ')}). `
+        + 'Reconnect the VPN with mac-dns off first so emunet can learn them, or add them: emunet vpn-dns add <domain> <server> [server…]');
+      process.exitCode = 1;
       return;
     }
     if (!(await emunetDnsAnswering())) {
@@ -1928,6 +2044,7 @@ const HELP = `emunet ${VERSION} — keep Android emulator and macOS internet wor
   emunet status                      show what emunet is doing
   emunet service install|uninstall   run emunet in the background at login / remove it
   emunet mac-dns on|off              point the Mac's DNS at emunet (survives broken VPN DNS) / undo
+  emunet vpn-dns [list|add|remove]   VPN DNS emunet remembers (for VPN clients that hide it, e.g. Tunnelblick)
   emunet upstream [auto|none|h:p]    debugging proxy to chain through (auto-detects Proxyman,
                                      Charles, mitmproxy, Burp, Fiddler, HTTP Toolkit, Requestly, Whistle)
   emunet emulator <avd> [--restart]  (re)start an emulator using emunet DNS
@@ -1949,6 +2066,9 @@ async function main(argv) {
       break;
     case 'fix':
       await cmdDoctor({ fix: true, yes: rest.includes('--yes') || rest.includes('-y') });
+      break;
+    case 'vpn-dns':
+      await cmdVpnDns(rest);
       break;
     case 'mac-dns':
       await cmdMacDns(rest[0]);

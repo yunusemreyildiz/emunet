@@ -27,6 +27,8 @@ Object.assign(process.env, {
   EMUNET_DRY_RUN: '1',
   EMUNET_FAKE_AGENTS: '',
   EMUNET_NO_EMULATORS: '1',
+  // Subprocesses must not read this Mac's real VPN / DNS state (tests set their own models).
+  EMUNET_DNS_MODEL: JSON.stringify({ defaults: [], dhcp: [], public: [] }),
   EMUNET_FAKE_SERVICE: JSON.stringify({ name: 'Wi-Fi', dnsServers: ['192.168.1.1'] }),
 });
 const emunet = await import(CLI);
@@ -633,4 +635,48 @@ test("the package entry point is importable without running the CLI (import { em
   assert.equal(pkg.exports['.'], './emunet.mjs');
   const r = await run(process.execPath, ['--input-type=module', '-e', `import { emulatorArgs } from ${JSON.stringify(CLI)}; console.log(typeof emulatorArgs)`]);
   assert.equal(r.stdout.trim(), 'function');
+});
+
+// ---------------------------------------------------------------------------
+// 11. VPN DNS unknown (Tunnelblick + mac-dns on): never hand VPN names to the router
+// ---------------------------------------------------------------------------
+
+test('VPN up, VPN DNS unknown: VPN names fail instead of reaching a hijacking router; public names still work', async () => {
+  model({ defaults: [srv('hijack')], dhcp: [srv('hijack')], vpn: [], vpnUp: true, vpnDomains: ['corp.example'] });
+  resetHits();
+  await assert.rejects(() => emunet.resolveRaw(emunet.buildQuery('gitlab.corp.example'), 'udp', { timeoutMs: 300 }));
+  assert.equal(hits.hijack.length, 0, 'the router was never asked about a VPN name');
+  assert.equal(hits.pub.length, 0);
+  assert.deepEqual((await ask('www.example.org')).addrs, ['192.168.1.1'], 'public names keep using the network DNS');
+});
+
+test('VPN up with known VPN DNS: VPN names go only to the VPN DNS', async () => {
+  vpnMode = 'answer';
+  model({ defaults: [srv('vpn'), srv('hijack')], dhcp: [srv('hijack')], vpn: [srv('vpn')], vpnUp: true, vpnDomains: ['corp.example'] });
+  resetHits();
+  assert.deepEqual((await ask('gitlab.corp.example')).addrs, ['10.0.0.5']);
+  assert.equal(hits.hijack.length, 0);
+});
+
+test('learnVpnDns / vpnServersFromMemory: remember per domain set, user entries win, only tunnel-routed servers are used', () => {
+  let m = emunet.learnVpnDns([], ['corp.example'], ['10.20.0.53', '10.20.0.54']);
+  assert.equal(m.length, 1);
+  assert.equal(emunet.learnVpnDns(m, ['corp.example'], ['10.20.0.53', '10.20.0.54']), m, 'unchanged → same object (no state write)');
+  m = emunet.learnVpnDns(m, ['corp.example'], ['10.9.9.9'], { manual: true });
+  assert.deepEqual(m[0].servers, ['10.9.9.9']);
+  assert.equal(emunet.learnVpnDns(m, ['corp.example'], ['10.20.0.53']), m, 'observation does not overwrite a manual entry');
+  const routed = new Set(['10.9.9.9']);
+  assert.deepEqual(emunet.vpnServersFromMemory(m, ['corp.example'], (s) => routed.has(s)), ['10.9.9.9']);
+  assert.deepEqual(emunet.vpnServersFromMemory(m, ['corp.example'], () => false), [], 'not routed through the tunnel → not used');
+  assert.deepEqual(emunet.vpnServersFromMemory(m, ['other.example'], () => true), []);
+});
+
+test('emunet vpn-dns add / list / remove', async () => {
+  const add = await run(process.execPath, [CLI, 'vpn-dns', 'add', 'corp.example', '10.20.0.53', '10.20.0.54']);
+  assert.equal(add.status, 0, add.stderr);
+  assert.match((await run(process.execPath, [CLI, 'vpn-dns', 'list'])).stdout, /corp\.example → 10\.20\.0\.53, 10\.20\.0\.54 {2}\(added by you/);
+  const bad = await run(process.execPath, [CLI, 'vpn-dns', 'add', 'corp.example', 'not-an-ip']);
+  assert.equal(bad.status, 1);
+  await run(process.execPath, [CLI, 'vpn-dns', 'remove', 'corp.example']);
+  assert.match((await run(process.execPath, [CLI, 'vpn-dns', 'list'])).stdout, /No VPN DNS remembered/);
 });
