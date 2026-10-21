@@ -1,6 +1,6 @@
 {
   "name": "emunet",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Keep Android emulator, iOS Simulator and macOS internet working across VPN and debugging-proxy changes",
   "type": "module",
   "bin": {
@@ -40,5 +40,9 @@
   "license": "MIT",
   "scripts": {
     "test": "node --test test/*.test.mjs"
+  },
+  "main": "emunet.mjs",
+  "exports": {
+    ".": "./emunet.mjs"
   }
 }

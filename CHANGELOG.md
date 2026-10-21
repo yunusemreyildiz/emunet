@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.0
+- `emunet emulator-args` and `import { emulatorArgs } from 'emunet'`: the emulator flags
+  (`-no-snapshot-load -dns-server 127.0.0.1`) for your own scripts, CI and Node tools — empty when
+  emunet is not running, so they are safe to use unconditionally.
+
 ## 0.5.1
 - Privacy: names under the VPN's domains or a per-domain resolver are never sent to public resolvers,
   even when every other DNS server is down.

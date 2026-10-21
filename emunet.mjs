@@ -23,7 +23,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const execFileAsync = promisify(execFile);
-const VERSION = '0.5.1';
+const VERSION = '0.6.0';
 
 // getaddrinfo runs on libuv's thread pool; a hung VPN resolver must not starve the proxy.
 process.env.UV_THREADPOOL_SIZE ||= '16';
@@ -1835,6 +1835,16 @@ async function cmdOff() {
   console.log('Emulator management is off. Turn it back on with: emunet on');
 }
 
+// Public helper for scripts and other tools: the emulator flags that make an emulator's DNS
+// survive VPN / network changes, or [] when emunet is not running (then nothing changes).
+//   import { emulatorArgs } from 'emunet';  spawn('emulator', ['-avd', name, ...await emulatorArgs()])
+//   emulator -avd Pixel_8 $(emunet emulator-args)
+// -no-snapshot-load is included because a snapshot boot restores the old DNS configuration.
+export async function emulatorArgs({ coldBoot = true } = {}) {
+  if (!(await emunetDnsAnswering(1500))) return [];
+  return [...(coldBoot ? ['-no-snapshot-load'] : []), '-dns-server', '127.0.0.1'];
+}
+
 async function cmdEmulator(avd, restart) {
   if (!avd) {
     console.error('Usage: emunet emulator <AVD name> [--restart]');
@@ -1921,6 +1931,7 @@ const HELP = `emunet ${VERSION} — keep Android emulator and macOS internet wor
   emunet upstream [auto|none|h:p]    debugging proxy to chain through (auto-detects Proxyman,
                                      Charles, mitmproxy, Burp, Fiddler, HTTP Toolkit, Requestly, Whistle)
   emunet emulator <avd> [--restart]  (re)start an emulator using emunet DNS
+  emunet emulator-args               flags for your own scripts: emulator -avd X $(emunet emulator-args)
   emunet off | on                    stop / resume managing emulator proxy settings
   emunet daemon                      run the service in the foreground (brew services uses this)`;
 
@@ -1954,6 +1965,9 @@ async function main(argv) {
       break;
     case 'off':
       await cmdOff();
+      break;
+    case 'emulator-args':
+      console.log((await emulatorArgs({ coldBoot: !rest.includes('--keep-snapshot') })).join(' '));
       break;
     case 'emulator':
       await cmdEmulator(rest.find((arg) => !arg.startsWith('-')), rest.includes('--restart'));

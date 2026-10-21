@@ -65,6 +65,7 @@ Android SDK platform-tools (`adb`) are needed for the emulator features.
 | `emunet mac-dns on\|off` | Point the Mac's own DNS at emunet so broken VPN DNS can't take the whole Mac down (see below) |
 | `emunet upstream [auto\|none\|host:port]` | Which debugging proxy to chain emulator traffic through |
 | `emunet emulator <avd> [--restart]` | (Re)start an emulator with emunet DNS |
+| `emunet emulator-args` | The emulator flags for your own scripts (empty when emunet is not running) |
 | `emunet off` / `emunet on` | Stop / resume managing emulator proxy settings |
 
 ## What `emunet fix` checks
@@ -153,16 +154,30 @@ server according to the routing table. Safety nets:
   DNS back and logs it to `~/Library/Logs/emunet.log`. It removes itself once emunet is uninstalled.
 - If emunet cannot bind its ports it exits, so launchd retries instead of keeping a service that does nothing.
 
-## Use with Android Studio / scripts
+## Use from your scripts, CI and Node projects
 
-Start emulators through emunet so their DNS survives network changes:
+The DNS flag only works when an emulator boots, so start emulators with it. emunet hands you the
+right flags, and nothing when it is not running — safe to use everywhere:
 
 ```bash
-emunet emulator Pixel_8_API_35            # add --restart if it is already running
+emulator -avd Pixel_8_API_35 $(emunet emulator-args)     # → -no-snapshot-load -dns-server 127.0.0.1
+emunet emulator Pixel_8_API_35 [--restart]                # or let emunet start it
 ```
 
-Your own scripts can do the same with `emulator -avd <name> -no-snapshot-load -dns-server 127.0.0.1`.
-(`-no-snapshot-load` matters: a snapshot boot restores the old DNS configuration.)
+From Node (`npm install emunet`):
+
+```js
+import { spawn } from 'node:child_process';
+import { emulatorArgs } from 'emunet';
+
+spawn('emulator', ['-avd', 'Pixel_8_API_35', ...await emulatorArgs()], { detached: true, stdio: 'ignore' });
+```
+
+`emulatorArgs({ coldBoot: false })` / `emunet emulator-args --keep-snapshot` leave out
+`-no-snapshot-load` (faster boot, but a snapshot boot restores the old DNS settings).
+
+Emulators started from Android Studio don't get the flag; their app traffic still goes through
+emunet's proxy, and `emunet fix` offers to restart them with emunet DNS.
 
 ## Configuration
 
@@ -204,7 +219,7 @@ or `npm uninstall -g emunet`.
 ## Development
 
 ```bash
-npm test                          # 38 tests; isolated config, dry-run, fake DNS servers — no system changes
+npm test                          # 45 tests; isolated config, dry-run, fake DNS servers — no system changes
 scripts/install-local.sh          # run this checkout as a LaunchAgent
 scripts/install-local.sh --brew   # or through a local Homebrew tap
 scripts/release.sh <owner> <tap>  # render the formula for a tagged GitHub release

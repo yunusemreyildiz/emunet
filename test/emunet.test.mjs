@@ -608,3 +608,29 @@ test('status page refuses requests with a foreign Host header (DNS rebinding)', 
     daemon.kill();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 10. emulatorArgs / emunet emulator-args
+// ---------------------------------------------------------------------------
+
+test('emulatorArgs is empty when emunet is not running, and gives the DNS flags when it is', async () => {
+  fs.writeFileSync(path.join(TMP, 'state.json'), JSON.stringify({ proxyPort: PORTS.emunetProxy, dnsPort: PORTS.dead, upstream: 'none', manageEmulators: false }));
+  const down = await import(`${CLI}?argsdown`);
+  assert.deepEqual(await down.emulatorArgs(), []);
+  assert.equal((await run(process.execPath, [CLI, 'emulator-args'])).stdout.trim(), '');
+
+  fs.writeFileSync(path.join(TMP, 'state.json'), JSON.stringify({ proxyPort: PORTS.emunetProxy, dnsPort: PORTS.health, upstream: 'none', manageEmulators: false }));
+  const up = await import(`${CLI}?argsup`);
+  assert.deepEqual(await up.emulatorArgs(), ['-no-snapshot-load', '-dns-server', '127.0.0.1']);
+  assert.deepEqual(await up.emulatorArgs({ coldBoot: false }), ['-dns-server', '127.0.0.1']);
+  assert.equal((await run(process.execPath, [CLI, 'emulator-args'])).stdout.trim(), '-no-snapshot-load -dns-server 127.0.0.1');
+  assert.equal((await run(process.execPath, [CLI, 'emulator-args', '--keep-snapshot'])).stdout.trim(), '-dns-server 127.0.0.1');
+  fs.writeFileSync(path.join(TMP, 'state.json'), JSON.stringify({ proxyPort: PORTS.emunetProxy, dnsPort: PORTS.emunetDns, upstream: 'none', manageEmulators: false }));
+});
+
+test("the package entry point is importable without running the CLI (import { emulatorArgs } from 'emunet')", async () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'));
+  assert.equal(pkg.exports['.'], './emunet.mjs');
+  const r = await run(process.execPath, ['--input-type=module', '-e', `import { emulatorArgs } from ${JSON.stringify(CLI)}; console.log(typeof emulatorArgs)`]);
+  assert.equal(r.stdout.trim(), 'function');
+});
